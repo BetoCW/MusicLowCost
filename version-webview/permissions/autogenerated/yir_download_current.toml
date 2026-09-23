@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-yir-download-current"
+description = "Enables the yir_download_current command without any pre-configured scope."
+commands.allow = ["yir_download_current"]
+
+[[permission]]
+identifier = "deny-yir-download-current"
+description = "Denies the yir_download_current command without any pre-configured scope."
+commands.deny = ["yir_download_current"]

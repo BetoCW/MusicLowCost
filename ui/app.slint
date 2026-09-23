@@ -1,0 +1,778 @@
+// Interfaz nativa de YoutubeInRustWeb (Slint, renderizado por software: ~6 MB).
+import { LineEdit, Switch, Button, ComboBox, Slider, ScrollView, ListView, SpinBox } from "std-widgets.slint";
+
+export struct TrackRow {
+    id: string,
+    title: string,
+    artist: string,
+    album: string,
+    duration: string,
+    cover: image,
+    current: bool,
+}
+
+export struct CardRow {
+    kind: string, // "album" | "artist" | "playlist"
+    kind-label: string,
+    id: string,
+    title: string,
+    subtitle: string,
+    cover: image,
+}
+
+export global AppState {
+    in-out property <string> page: "home";
+    in property <bool> loading;
+    in property <string> status;
+    in property <bool> logged-in;
+    // Fuente activa: "yt" (YouTube Music) o "sp" (Spotify)
+    in-out property <string> source: "yt";
+    in property <bool> sp-logged;
+
+    in property <[TrackRow]> home-tracks;
+    in property <[CardRow]> home-cards;
+    in property <[TrackRow]> search-tracks;
+    in property <[CardRow]> search-cards;
+    in property <[TrackRow]> library-tracks;
+    in property <[CardRow]> library-cards;
+    in property <[TrackRow]> queue;
+
+    in property <string> detail-kind;
+    in property <string> detail-title;
+    in property <string> detail-subtitle;
+    in property <image> detail-cover;
+    in property <[TrackRow]> detail-tracks;
+    in property <[CardRow]> detail-cards;
+
+    // Reproductor
+    in property <bool> has-song;
+    in property <bool> playing;
+    in property <bool> buffering;
+    in property <string> now-title;
+    in property <string> now-artist;
+    in property <image> now-cover;
+    in property <float> position; // segundos
+    in property <float> duration;
+    in property <string> position-text: "0:00";
+    in property <string> duration-text: "0:00";
+    in property <float> volume: 80; // 0..100
+    in property <bool> shuffle;
+    in property <int> repeat; // 0 no, 1 todo, 2 una
+
+    // Letra
+    in property <[string]> lyrics;
+    in property <string> lyrics-plain;
+    in property <int> lyrics-current: -1;
+    in property <string> lyrics-status;
+
+    callback navigate(string);
+    callback search(string);
+    callback play-track(string, int); // lista, indice
+    callback enqueue(string, int);
+    callback open-card(string, string); // kind, id
+    callback open-artist-of-current();
+    callback play-detail(bool); // aleatorio
+    callback toggle-play();
+    callback next();
+    callback previous();
+    callback seek(float);
+    callback set-volume(float);
+    callback volume-wheel(float);
+    callback toggle-shuffle();
+    callback cycle-repeat();
+    callback queue-remove(int);
+    callback queue-clear();
+    callback save-settings();
+    callback login(string);
+    callback logout();
+    callback lastfm-connect();
+    callback set-source(string);
+    callback sp-login();
+    callback sp-logout();
+}
+
+export global Cfg {
+    in-out property <bool> close-to-tray;
+    in-out property <bool> restore-session;
+    in-out property <bool> autoplay-radio;
+    in-out property <bool> notifications;
+    in-out property <int> quality; // 0 alta, 1 ahorro
+    in-out property <string> country;
+    in-out property <bool> exponential-volume;
+    in-out property <bool> skip-silence;
+    in-out property <bool> sponsorblock;
+    in-out property <bool> synced-lyrics;
+    in-out property <bool> eq-enabled;
+    in-out property <float> eq0;
+    in-out property <float> eq1;
+    in-out property <float> eq2;
+    in-out property <float> eq3;
+    in-out property <float> eq4;
+    in-out property <float> eq5;
+    in-out property <float> eq6;
+    in-out property <float> eq7;
+    in-out property <float> eq8;
+    in-out property <float> eq9;
+    in-out property <bool> discord;
+    in-out property <bool> discord-hide-paused;
+    in-out property <bool> lastfm;
+    in property <string> lastfm-status;
+    in-out property <bool> listenbrainz;
+    in-out property <string> listenbrainz-token;
+    in-out property <bool> api-server;
+    in-out property <int> api-port: 26538;
+    in-out property <bool> shortcuts;
+    in-out property <string> sc-play;
+    in-out property <string> sc-next;
+    in-out property <string> sc-prev;
+    in-out property <string> sc-show;
+    in-out property <int> browser; // 0 firefox, 1 edge, 2 chrome, 3 brave
+    in property <string> account-status;
+    in property <string> sp-status;
+}
+
+component IconButton inherits Rectangle {
+    in property <string> glyph;
+    in property <bool> active;
+    in property <length> size: 36px;
+    in property <length> glyph-size: self.size * 0.45;
+    callback clicked;
+    width: self.size;
+    height: self.size;
+    border-radius: self.size / 2;
+    background: ta.pressed ? #ffffff33 : ta.has-hover ? #ffffff1a : transparent;
+    Text {
+        text: root.glyph;
+        color: root.active ? #ff4e45 : #ffffff;
+        font-size: root.glyph-size;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component NavItem inherits Rectangle {
+    in property <string> text;
+    in property <string> glyph;
+    in property <bool> active;
+    callback clicked;
+    height: 44px;
+    border-radius: 8px;
+    background: root.active ? #ffffff1f : ta.has-hover ? #ffffff0f : transparent;
+    HorizontalLayout {
+        padding-left: 14px;
+        spacing: 14px;
+        Text { text: root.glyph; color: #fff; font-size: 16px; vertical-alignment: center; width: 20px; }
+        Text { text: root.text; color: #fff; font-size: 14px; vertical-alignment: center; font-weight: root.active ? 700 : 400; }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Tab inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked;
+    height: 32px;
+    width: t.preferred-width + 28px;
+    border-radius: 16px;
+    background: root.active ? #ffffff : ta.has-hover ? #ffffff2a : #ffffff1a;
+    t := Text {
+        text: root.text;
+        color: root.active ? #000 : #fff;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Cover inherits Rectangle {
+    in property <image> source;
+    in property <length> size: 40px;
+    in property <bool> round;
+    width: self.size;
+    height: self.size;
+    border-radius: root.round ? self.size / 2 : 4px;
+    background: #2a2a2a;
+    clip: true;
+    Image {
+        source: root.source;
+        width: root.size;
+        height: root.size;
+        image-fit: cover;
+    }
+}
+
+component TrackItem inherits Rectangle {
+    in property <TrackRow> item;
+    in property <int> index;
+    in property <bool> removable;
+    callback play(int);
+    callback add(int);
+    callback remove(int);
+    height: 56px;
+    background: root.item.current ? #ffffff1f : ta.has-hover ? #ffffff0d : transparent;
+    border-radius: 6px;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.play(root.index); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 6px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Cover { source: root.item.cover; size: 40px; }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 3;
+            Text { text: root.item.title; color: root.item.current ? #ff4e45 : #fff; font-size: 14px; overflow: elide; }
+            Text { text: root.item.artist; color: #aaa; font-size: 12px; overflow: elide; }
+        }
+        Text { text: root.item.album; color: #aaa; font-size: 12px; overflow: elide; vertical-alignment: center; horizontal-stretch: 2; }
+        Text { text: root.item.duration; color: #aaa; font-size: 12px; vertical-alignment: center; width: 44px; horizontal-alignment: right; }
+        VerticalLayout {
+            alignment: center;
+            IconButton {
+                size: 30px;
+                glyph: root.removable ? "×" : "+";
+                clicked => {
+                    if (root.removable) { root.remove(root.index); } else { root.add(root.index); }
+                }
+            }
+        }
+    }
+}
+
+component CardItem inherits Rectangle {
+    in property <CardRow> item;
+    callback open(string, string);
+    height: 64px;
+    border-radius: 6px;
+    background: ta.has-hover ? #ffffff0d : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.open(root.item.kind, root.item.id); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Cover { source: root.item.cover; size: 48px; round: root.item.kind == "artist"; }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            Text { text: root.item.title; color: #fff; font-size: 14px; overflow: elide; }
+            Text { text: root.item.kind-label + (root.item.subtitle != "" ? " • " + root.item.subtitle : ""); color: #aaa; font-size: 12px; overflow: elide; }
+        }
+    }
+}
+
+component TrackList inherits ListView {
+    in property <[TrackRow]> rows;
+    in property <string> list;
+    in property <bool> removable;
+    for row[i] in root.rows: TrackItem {
+        item: row;
+        index: i;
+        removable: root.removable;
+        play(i) => { AppState.play-track(root.list, i); }
+        add(i) => { AppState.enqueue(root.list, i); }
+        remove(i) => { AppState.queue-remove(i); }
+    }
+}
+
+component CardList inherits ListView {
+    in property <[CardRow]> rows;
+    for row in root.rows: CardItem {
+        item: row;
+        open(kind, id) => { AppState.open-card(kind, id); }
+    }
+}
+
+component PageTitle inherits Text {
+    color: #fff;
+    font-size: 26px;
+    font-weight: 700;
+}
+
+component Empty inherits Text {
+    color: #888;
+    font-size: 14px;
+    horizontal-alignment: center;
+}
+
+component HomePage inherits VerticalLayout {
+    property <int> tab: 0;
+    spacing: 12px;
+    PageTitle { text: "Inicio"; }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+        Tab { text: AppState.source == "sp" ? "Escuchado recientemente" : "Top canciones"; active: root.tab == 0; clicked => { root.tab = 0; } }
+        Tab { text: AppState.source == "sp" ? "Tus listas y artistas" : "Nuevos álbumes y listas"; active: root.tab == 1; clicked => { root.tab = 1; } }
+    }
+    if root.tab == 0: TrackList { rows: AppState.home-tracks; list: "home"; }
+    if root.tab == 1: CardList { rows: AppState.home-cards; }
+}
+
+component SearchPage inherits VerticalLayout {
+    property <int> tab: 0;
+    spacing: 12px;
+    PageTitle { text: "Buscar"; }
+    LineEdit {
+        placeholder-text: "Canciones, álbumes, artistas, listas… (Enter)";
+        accepted(text) => { AppState.search(text); }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+        Tab { text: "Canciones"; active: root.tab == 0; clicked => { root.tab = 0; } }
+        Tab { text: "Álbumes, artistas y listas"; active: root.tab == 1; clicked => { root.tab = 1; } }
+    }
+    if root.tab == 0: TrackList { rows: AppState.search-tracks; list: "search"; }
+    if root.tab == 1: CardList { rows: AppState.search-cards; }
+}
+
+component DetailPage inherits VerticalLayout {
+    property <int> tab: 0;
+    spacing: 12px;
+    HorizontalLayout {
+        spacing: 20px;
+        Cover { source: AppState.detail-cover; size: 150px; round: AppState.detail-kind == "artist"; }
+        VerticalLayout {
+            alignment: center;
+            spacing: 8px;
+            Text { text: AppState.detail-title; color: #fff; font-size: 28px; font-weight: 700; overflow: elide; }
+            Text { text: AppState.detail-subtitle; color: #aaa; font-size: 14px; overflow: elide; }
+            HorizontalLayout {
+                spacing: 10px;
+                alignment: start;
+                Button { text: "▶  Reproducir"; primary: true; clicked => { AppState.play-detail(false); } }
+                Button { text: "⇄  Aleatorio"; clicked => { AppState.play-detail(true); } }
+            }
+        }
+    }
+    if AppState.detail-cards.length > 0: HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+        Tab { text: "Canciones"; active: root.tab == 0; clicked => { root.tab = 0; } }
+        Tab { text: "Álbumes y relacionados"; active: root.tab == 1; clicked => { root.tab = 1; } }
+    }
+    if root.tab == 0 || AppState.detail-cards.length == 0: TrackList { rows: AppState.detail-tracks; list: "detail"; }
+    if root.tab == 1 && AppState.detail-cards.length > 0: CardList { rows: AppState.detail-cards; }
+}
+
+component LibraryPage inherits VerticalLayout {
+    property <int> tab: 0;
+    property <bool> logged: AppState.source == "sp" ? AppState.sp-logged : AppState.logged-in;
+    spacing: 12px;
+    PageTitle { text: "Biblioteca"; }
+    if !root.logged: Empty {
+        text: AppState.source == "sp" ? "Inicia sesión en Ajustes → Spotify para ver tus canciones y listas." : "Inicia sesión en Ajustes → Cuenta para ver tus Me gusta y tus listas.";
+        horizontal-alignment: left;
+    }
+    if root.logged: HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+        Tab { text: "Me gusta"; active: root.tab == 0; clicked => { root.tab = 0; } }
+        Tab { text: "Listas y álbumes"; active: root.tab == 1; clicked => { root.tab = 1; } }
+    }
+    if root.logged && root.tab == 0: TrackList { rows: AppState.library-tracks; list: "library"; }
+    if root.logged && root.tab == 1: CardList { rows: AppState.library-cards; }
+    if !root.logged: Rectangle { }
+}
+
+component QueuePage inherits VerticalLayout {
+    spacing: 12px;
+    HorizontalLayout {
+        PageTitle { text: "Cola"; }
+        Rectangle { }
+        Button { text: "Vaciar"; clicked => { AppState.queue-clear(); } }
+    }
+    if AppState.queue.length == 0: Empty { text: "La cola está vacía"; }
+    TrackList { rows: AppState.queue; list: "queue"; removable: true; }
+}
+
+component LyricsPage inherits VerticalLayout {
+    property <int> cur: AppState.lyrics-current;
+    property <length> line-h: 38px;
+    spacing: 12px;
+    changed cur => {
+        lv.content-y = min(0px, -(self.cur * self.line-h) + lv.visible-height / 2 - self.line-h / 2);
+    }
+    PageTitle { text: "Letra"; }
+    if AppState.lyrics-status != "": Empty { text: AppState.lyrics-status; }
+    lv := ListView {
+        visible: AppState.lyrics.length > 0;
+        for line[i] in AppState.lyrics: Text {
+            height: root.line-h;
+            text: line;
+            color: i == AppState.lyrics-current ? #fff : #777;
+            font-size: i == AppState.lyrics-current ? 20px : 17px;
+            font-weight: i == AppState.lyrics-current ? 700 : 400;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+    if AppState.lyrics.length == 0 && AppState.lyrics-plain != "": ScrollView {
+        VerticalLayout {
+            Text { text: AppState.lyrics-plain; color: #ddd; font-size: 16px; wrap: word-wrap; }
+        }
+    }
+}
+
+component Section inherits VerticalLayout {
+    in property <string> title;
+    spacing: 6px;
+    padding-bottom: 14px;
+    Text { text: root.title; color: #ff4e45; font-size: 15px; font-weight: 700; }
+    @children
+}
+
+component Field inherits HorizontalLayout {
+    in property <string> label;
+    spacing: 12px;
+    Text { text: root.label; color: #ddd; vertical-alignment: center; width: 230px; }
+    @children
+}
+
+component EqBand inherits VerticalLayout {
+    in property <string> label;
+    in-out property <float> value;
+    spacing: 2px;
+    alignment: center;
+    Slider {
+        orientation: vertical;
+        minimum: -12;
+        maximum: 12;
+        height: 120px;
+        value <=> root.value;
+    }
+    Text { text: root.label; color: #aaa; font-size: 11px; horizontal-alignment: center; }
+    Text { text: round(root.value) + " dB"; color: #777; font-size: 10px; horizontal-alignment: center; }
+}
+
+component SettingsPage inherits VerticalLayout {
+    spacing: 12px;
+    HorizontalLayout {
+        PageTitle { text: "Ajustes"; }
+        Rectangle { }
+        Button { text: "Guardar"; primary: true; clicked => { AppState.save-settings(); } }
+    }
+    ScrollView {
+        VerticalLayout {
+            padding-right: 16px;
+            Section {
+                title: "General";
+                Switch { text: "Cerrar a la bandeja en vez de salir"; checked <=> Cfg.close-to-tray; }
+                Switch { text: "Recordar la cola al abrir (sin reproducir sola)"; checked <=> Cfg.restore-session; }
+                Switch { text: "Al terminar la cola, seguir con canciones parecidas (radio)"; checked <=> Cfg.autoplay-radio; }
+                Switch { text: "Notificación al cambiar de canción"; checked <=> Cfg.notifications; }
+                Field {
+                    label: "Calidad de audio";
+                    ComboBox { model: ["Alta (AAC 128 kbps)", "Ahorro de datos (AAC 48 kbps)"]; current-index <=> Cfg.quality; }
+                }
+                Field {
+                    label: "País para las listas (ej. MX, ES, US)";
+                    LineEdit { text <=> Cfg.country; }
+                }
+            }
+            Section {
+                title: "Spotify (requiere Premium)";
+                Text { text: Cfg.sp-status; color: #aaa; wrap: word-wrap; }
+                Text {
+                    text: "Se abre la página oficial de Spotify en tu navegador; al aceptar, vuelve aquí.";
+                    color: #777;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: start;
+                    Button { text: "Iniciar sesión con Spotify"; clicked => { AppState.sp-login(); } }
+                    if AppState.sp-logged: Button { text: "Cerrar sesión"; clicked => { AppState.sp-logout(); } }
+                }
+            }
+            Section {
+                title: "Cuenta de YouTube Music (opcional)";
+                Text { text: Cfg.account-status; color: #aaa; wrap: word-wrap; }
+                Text {
+                    text: "Se abre una ventana de Google; entra con tu cuenta y se cierra sola al llegar a YouTube Music.";
+                    color: #777;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: start;
+                    Button { text: "Iniciar sesión con Google"; clicked => { AppState.login(""); } }
+                    if AppState.logged-in: Button { text: "Cerrar sesión"; clicked => { AppState.logout(); } }
+                }
+            }
+            Section {
+                title: "Audio";
+                Switch { text: "Volumen exponencial (más control a volumen bajo)"; checked <=> Cfg.exponential-volume; }
+                Switch { text: "Saltar silencio al inicio de cada canción"; checked <=> Cfg.skip-silence; }
+                Switch { text: "SponsorBlock (saltar partes sin música de videoclips)"; checked <=> Cfg.sponsorblock; }
+                Switch { text: "Letras sincronizadas (LRCLIB), si no, la de YouTube Music"; checked <=> Cfg.synced-lyrics; }
+                Switch { text: "Ecualizador"; checked <=> Cfg.eq-enabled; }
+                HorizontalLayout {
+                    spacing: 4px;
+                    alignment: start;
+                    EqBand { label: "60"; value <=> Cfg.eq0; }
+                    EqBand { label: "170"; value <=> Cfg.eq1; }
+                    EqBand { label: "310"; value <=> Cfg.eq2; }
+                    EqBand { label: "600"; value <=> Cfg.eq3; }
+                    EqBand { label: "1k"; value <=> Cfg.eq4; }
+                    EqBand { label: "3k"; value <=> Cfg.eq5; }
+                    EqBand { label: "6k"; value <=> Cfg.eq6; }
+                    EqBand { label: "12k"; value <=> Cfg.eq7; }
+                    EqBand { label: "14k"; value <=> Cfg.eq8; }
+                    EqBand { label: "16k"; value <=> Cfg.eq9; }
+                }
+            }
+            Section {
+                title: "Integraciones";
+                Switch { text: "Discord Rich Presence"; checked <=> Cfg.discord; }
+                Switch { text: "Ocultar en Discord al pausar"; checked <=> Cfg.discord-hide-paused; }
+                Switch { text: "Scrobbling a Last.fm"; checked <=> Cfg.lastfm; }
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: start;
+                    Button { text: "Conectar Last.fm"; clicked => { AppState.lastfm-connect(); } }
+                    Text { text: Cfg.lastfm-status; color: #aaa; vertical-alignment: center; }
+                }
+                Switch { text: "Scrobbling a ListenBrainz"; checked <=> Cfg.listenbrainz; }
+                Field { label: "Token de ListenBrainz"; LineEdit { text <=> Cfg.listenbrainz-token; } }
+                Switch { text: "API local HTTP en 127.0.0.1 (compatible con Pear)"; checked <=> Cfg.api-server; }
+                Field { label: "Puerto de la API"; SpinBox { minimum: 1024; maximum: 65535; value <=> Cfg.api-port; } }
+            }
+            Section {
+                title: "Atajos globales";
+                Switch { text: "Activar atajos globales"; checked <=> Cfg.shortcuts; }
+                Field { label: "Play / Pausa"; LineEdit { text <=> Cfg.sc-play; } }
+                Field { label: "Siguiente"; LineEdit { text <=> Cfg.sc-next; } }
+                Field { label: "Anterior"; LineEdit { text <=> Cfg.sc-prev; } }
+                Field { label: "Mostrar / ocultar ventana"; LineEdit { text <=> Cfg.sc-show; } }
+                Text { text: "Las teclas multimedia del teclado siempre funcionan."; color: #888; font-size: 12px; }
+            }
+        }
+    }
+}
+
+// Barra de progreso propia (el Slider estandar pierde el enlace al arrastrar).
+component ProgressBar inherits Rectangle {
+    in property <float> fraction;
+    in property <bool> enabled: true;
+    callback seek(float);
+    callback wheel(float);
+    property <float> drag-fraction: -1;
+    height: 16px;
+    Rectangle {
+        y: (parent.height - self.height) / 2;
+        height: ta.has-hover ? 6px : 4px;
+        border-radius: 3px;
+        background: #ffffff33;
+        Rectangle {
+            x: 0;
+            width: parent.width * (root.drag-fraction >= 0 ? root.drag-fraction : clamp(root.fraction, 0, 1));
+            border-radius: 3px;
+            background: #ff4e45;
+        }
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        moved => {
+            if (self.pressed) { root.drag-fraction = clamp(self.mouse-x / self.width, 0, 1); }
+        }
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down) {
+                root.drag-fraction = clamp(self.mouse-x / self.width, 0, 1);
+            }
+            if (ev.kind == PointerEventKind.up && root.drag-fraction >= 0) {
+                root.seek(root.drag-fraction);
+                root.drag-fraction = -1;
+            }
+        }
+        scroll-event(ev) => {
+            root.wheel(ev.delta-y / 1px);
+            accept
+        }
+    }
+}
+
+component PlayerBar inherits Rectangle {
+    height: 84px;
+    background: #212121;
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        spacing: 14px;
+        // Cancion actual
+        HorizontalLayout {
+            width: 280px;
+            spacing: 10px;
+            VerticalLayout {
+                alignment: center;
+                Cover { source: AppState.now-cover; size: 56px; }
+            }
+            VerticalLayout {
+                alignment: center;
+                Text { text: AppState.has-song ? AppState.now-title : "Nada sonando"; color: #fff; font-size: 14px; overflow: elide; }
+                artist := Text {
+                    text: AppState.buffering ? "Cargando…" : AppState.now-artist;
+                    color: artist-ta.has-hover ? #fff : #aaa;
+                    font-size: 12px;
+                    overflow: elide;
+                    artist-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { AppState.open-artist-of-current(); }
+                    }
+                }
+            }
+        }
+        // Controles
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            HorizontalLayout {
+                alignment: center;
+                spacing: 6px;
+                IconButton { glyph: "⇄"; active: AppState.shuffle; clicked => { AppState.toggle-shuffle(); } }
+                IconButton { glyph: "⏮"; clicked => { AppState.previous(); } }
+                IconButton {
+                    glyph: AppState.playing ? "⏸" : "▶";
+                    size: 44px;
+                    background: #ffffff;
+                    Text { text: parent.glyph; color: #000; font-size: 20px; }
+                    clicked => { AppState.toggle-play(); }
+                }
+                IconButton { glyph: "⏭"; clicked => { AppState.next(); } }
+                IconButton {
+                    glyph: AppState.repeat == 2 ? "🔂" : "🔁";
+                    active: AppState.repeat > 0;
+                    clicked => { AppState.cycle-repeat(); }
+                }
+            }
+            HorizontalLayout {
+                spacing: 10px;
+                Text { text: AppState.position-text; color: #aaa; font-size: 11px; vertical-alignment: center; width: 40px; horizontal-alignment: right; }
+                ProgressBar {
+                    horizontal-stretch: 1;
+                    enabled: AppState.duration > 0;
+                    fraction: AppState.duration > 0 ? AppState.position / AppState.duration : 0;
+                    seek(f) => { AppState.seek(f * AppState.duration); }
+                }
+                Text { text: AppState.duration-text; color: #aaa; font-size: 11px; vertical-alignment: center; width: 40px; }
+            }
+        }
+        // Volumen y paginas rapidas
+        HorizontalLayout {
+            width: 250px;
+            spacing: 6px;
+            alignment: end;
+            IconButton { glyph: "♪"; active: AppState.page == "lyrics"; clicked => { AppState.navigate("lyrics"); } }
+            IconButton { glyph: "≡"; active: AppState.page == "queue"; clicked => { AppState.navigate("queue"); } }
+            Text { text: AppState.volume == 0 ? "🔇" : "🔊"; color: #fff; vertical-alignment: center; font-size: 15px; }
+            VerticalLayout {
+                alignment: center;
+                ProgressBar {
+                    width: 100px;
+                    fraction: AppState.volume / 100;
+                    seek(f) => { AppState.set-volume(f * 100); }
+                    wheel(d) => { AppState.volume-wheel(d); }
+                }
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "YoutubeInRustWeb";
+    icon: @image-url("../icons/icon.png");
+    preferred-width: 1100px;
+    preferred-height: 720px;
+    min-width: 760px;
+    min-height: 480px;
+    background: #0f0f0f;
+    default-font-size: 14px;
+
+    VerticalLayout {
+        HorizontalLayout {
+            vertical-stretch: 1;
+            // Barra lateral
+            Rectangle {
+                width: 210px;
+                background: #0a0a0a;
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 4px;
+                    alignment: start;
+                    Text { text: "▶ YoutubeInRust"; color: #fff; font-size: 18px; font-weight: 700; height: 48px; vertical-alignment: center; }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        padding-bottom: 8px;
+                        Tab { text: "YouTube"; active: AppState.source == "yt"; clicked => { AppState.set-source("yt"); } }
+                        Tab { text: "Spotify"; active: AppState.source == "sp"; clicked => { AppState.set-source("sp"); } }
+                    }
+                    NavItem { glyph: "⌂"; text: "Inicio"; active: AppState.page == "home"; clicked => { AppState.navigate("home"); } }
+                    NavItem { glyph: "◎"; text: "Buscar"; active: AppState.page == "search"; clicked => { AppState.navigate("search"); } }
+                    NavItem { glyph: "♥"; text: "Biblioteca"; active: AppState.page == "library"; clicked => { AppState.navigate("library"); } }
+                    NavItem { glyph: "≡"; text: "Cola"; active: AppState.page == "queue"; clicked => { AppState.navigate("queue"); } }
+                    NavItem { glyph: "♪"; text: "Letra"; active: AppState.page == "lyrics"; clicked => { AppState.navigate("lyrics"); } }
+                    NavItem { glyph: "⚙"; text: "Ajustes"; active: AppState.page == "settings"; clicked => { AppState.navigate("settings"); } }
+                }
+            }
+            // Contenido
+            Rectangle {
+                horizontal-stretch: 1;
+                VerticalLayout {
+                    padding: 20px;
+                    padding-bottom: 8px;
+                    spacing: 8px;
+                    if AppState.page == "home": HomePage { vertical-stretch: 1; }
+                    if AppState.page == "search": SearchPage { vertical-stretch: 1; }
+                    if AppState.page == "detail": DetailPage { vertical-stretch: 1; }
+                    if AppState.page == "library": LibraryPage { vertical-stretch: 1; }
+                    if AppState.page == "queue": QueuePage { vertical-stretch: 1; }
+                    if AppState.page == "lyrics": LyricsPage { vertical-stretch: 1; }
+                    if AppState.page == "settings": SettingsPage { vertical-stretch: 1; }
+                    if AppState.loading || AppState.status != "": Text {
+                        text: AppState.loading ? "Cargando…" : AppState.status;
+                        color: AppState.loading ? #aaa : #ffb74d;
+                        font-size: 12px;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+        PlayerBar { }
+    }
+}
+
+// Ventana del proceso `--login` (el WebView de Google se dibuja encima).
+export component LoginWindow inherits Window {
+    // Siempre encima: si no, Windows a veces la abre detras de otras ventanas.
+    always-on-top: true;
+    title: "Iniciar sesión — YoutubeInRustWeb";
+    icon: @image-url("../icons/icon.png");
+    preferred-width: 520px;
+    preferred-height: 720px;
+    background: #ffffff;
+}

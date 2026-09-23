@@ -1,0 +1,13 @@
+# Build output
+/target
+/app
+/gen
+/installer/Output
+
+# Previous version (Tauri + WebView2): source only
+/version-webview/target
+/version-webview/app
+/version-webview/gen
+
+# Personal notes (not published)
+/NOTAS-PARA-MA*.md

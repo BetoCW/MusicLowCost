@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-yir-play-state"
+description = "Enables the yir_play_state command without any pre-configured scope."
+commands.allow = ["yir_play_state"]
+
+[[permission]]
+identifier = "deny-yir-play-state"
+description = "Denies the yir_play_state command without any pre-configured scope."
+commands.deny = ["yir_play_state"]

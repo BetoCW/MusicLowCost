@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "youtube-music",
+  "description": "Permite que la pagina de YouTube Music hable SOLO con los comandos de la app (nada de sistema de archivos ni shell).",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["https://music.youtube.com/*"]
+  },
+  "permissions": [
+    "allow-yir-log",
+    "allow-yir-get-config",
+    "allow-yir-set-config",
+    "allow-yir-song-changed",
+    "allow-yir-play-state",
+    "allow-yir-fetch-lyrics",
+    "allow-yir-sponsor-segments",
+    "allow-yir-lastfm-connect",
+    "allow-yir-download-current"
+  ]
+}

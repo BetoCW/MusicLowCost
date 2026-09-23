@@ -1,0 +1,548 @@
+//! Motor de audio: rodio + symphonia (AAC/M4A) y efectos propios
+//! (ecualizador de 10 bandas y saltar silencio inicial), port de los plugins
+//! equalizer y skip-silences de Pear pero en Rust puro.
+
+use rodio::{ChannelCount, Decoder, Player, SampleRate, Source};
+use std::io::Cursor;
+use std::num::NonZero;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
+
+pub const EQ_FREQS: [f32; 10] = [60.0, 170.0, 310.0, 600.0, 1000.0, 3000.0, 6000.0, 12000.0, 14000.0, 16000.0];
+
+/// Parametros compartidos entre la interfaz y el hilo de audio.
+pub struct Effects {
+    pub eq_enabled: AtomicBool,
+    pub eq_gains: Mutex<[f32; 10]>,
+    /// Se incrementa cada vez que cambian las ganancias para recalcular filtros.
+    pub eq_version: AtomicU32,
+    pub skip_silence: AtomicBool,
+}
+
+impl Effects {
+    pub fn new(enabled: bool, gains: [f32; 10], skip_silence: bool) -> Arc<Self> {
+        Arc::new(Self {
+            eq_enabled: AtomicBool::new(enabled),
+            eq_gains: Mutex::new(gains),
+            eq_version: AtomicU32::new(1),
+            skip_silence: AtomicBool::new(skip_silence),
+        })
+    }
+
+    pub fn set_eq(&self, enabled: bool, gains: [f32; 10]) {
+        self.eq_enabled.store(enabled, Ordering::Relaxed);
+        *self.eq_gains.lock().unwrap() = gains;
+        self.eq_version.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Buffer entre el decodificador de Spotify (librespot, en su propio hilo) y nuestro
+/// motor de audio. librespot escribe muestras aqui; si el buffer esta lleno (por ejemplo
+/// en pausa) espera, asi decodifica solo a velocidad de reproduccion.
+pub struct StreamBuf {
+    q: Mutex<std::collections::VecDeque<f32>>,
+    cv: std::sync::Condvar,
+    /// Mientras sea true se descartan las muestras (cambio de cancion o seek).
+    flushing: AtomicBool,
+    pub ended: AtomicBool,
+    base_ms: std::sync::atomic::AtomicU64,
+    frames: std::sync::atomic::AtomicU64,
+}
+
+pub const STREAM_RATE: u32 = 44100;
+const STREAM_CH: usize = 2;
+/// ~2 s de audio estereo.
+const STREAM_MAX: usize = STREAM_RATE as usize * STREAM_CH * 2;
+
+impl StreamBuf {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            q: Mutex::new(std::collections::VecDeque::with_capacity(STREAM_MAX)),
+            cv: std::sync::Condvar::new(),
+            flushing: AtomicBool::new(true),
+            ended: AtomicBool::new(false),
+            base_ms: std::sync::atomic::AtomicU64::new(0),
+            frames: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Llamado desde el hilo de librespot.
+    pub fn push(&self, samples: &[f32]) {
+        let mut q = self.q.lock().unwrap();
+        loop {
+            if self.flushing.load(Ordering::Relaxed) {
+                return;
+            }
+            if q.len() < STREAM_MAX {
+                break;
+            }
+            q = self.cv.wait_timeout(q, Duration::from_millis(100)).unwrap().0;
+        }
+        q.extend(samples.iter().copied());
+    }
+
+    /// Vacia el buffer y descarta lo que llegue hasta `end_flush`.
+    pub fn begin_flush(&self, position_ms: u64) {
+        self.flushing.store(true, Ordering::Relaxed);
+        self.q.lock().unwrap().clear();
+        self.base_ms.store(position_ms, Ordering::Relaxed);
+        self.frames.store(0, Ordering::Relaxed);
+        self.ended.store(false, Ordering::Relaxed);
+        self.cv.notify_all();
+    }
+
+    pub fn end_flush(&self) {
+        self.flushing.store(false, Ordering::Relaxed);
+    }
+
+    pub fn position(&self) -> f64 {
+        self.base_ms.load(Ordering::Relaxed) as f64 / 1000.0
+            + self.frames.load(Ordering::Relaxed) as f64 / STREAM_RATE as f64
+    }
+}
+
+/// Lado de rodio del StreamBuf. Si faltan datos devuelve silencio (sin contar tiempo).
+struct StreamSource {
+    buf: Arc<StreamBuf>,
+    local: std::collections::VecDeque<f32>,
+    ch: usize,
+}
+
+impl Iterator for StreamSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        if self.local.is_empty() {
+            let mut q = self.buf.q.lock().unwrap();
+            let n = q.len().min(4096) / STREAM_CH * STREAM_CH;
+            self.local.extend(q.drain(..n));
+            drop(q);
+            self.buf.cv.notify_all();
+        }
+        match self.local.pop_front() {
+            Some(s) => {
+                self.ch += 1;
+                if self.ch == STREAM_CH {
+                    self.ch = 0;
+                    self.buf.frames.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(s)
+            }
+            None if self.buf.ended.load(Ordering::Relaxed) && self.buf.q.lock().unwrap().is_empty() => None,
+            None => Some(0.0),
+        }
+    }
+}
+
+impl Source for StreamSource {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> ChannelCount {
+        NonZero::new(STREAM_CH as u16).unwrap()
+    }
+    fn sample_rate(&self) -> SampleRate {
+        NonZero::new(STREAM_RATE).unwrap()
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+    fn try_seek(&mut self, _pos: Duration) -> Result<(), rodio::source::SeekError> {
+        // El seek real lo hace librespot (ver spotify.rs); aqui solo se tira lo local.
+        self.local.clear();
+        self.ch = 0;
+        Ok(())
+    }
+}
+
+pub struct Engine {
+    mixer: rodio::mixer::Mixer,
+    player: Mutex<Option<Player>>,
+    /// Si la cancion actual viene de Spotify, su buffer (para la posicion).
+    stream: Mutex<Option<Arc<StreamBuf>>>,
+    pub fx: Arc<Effects>,
+    volume: Mutex<f32>,
+}
+
+impl Engine {
+    /// Abre la salida de audio en un hilo propio (el stream de WASAPI no es Send).
+    pub fn start(fx: Arc<Effects>) -> Result<Arc<Self>, String> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("audio-out".into())
+            .stack_size(256 * 1024)
+            .spawn(move || match rodio::DeviceSinkBuilder::open_default_sink() {
+                Ok(mut sink) => {
+                    sink.log_on_drop(false);
+                    let _ = tx.send(Ok(sink.mixer().clone()));
+                    // El sink tiene que seguir vivo mientras la app corra.
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.to_string()));
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        let mixer = rx.recv().map_err(|e| e.to_string())??;
+        Ok(Arc::new(Self { mixer, player: Mutex::new(None), stream: Mutex::new(None), fx, volume: Mutex::new(0.8) }))
+    }
+
+    /// Reemplaza lo que suena por `data` (archivo M4A completo en memoria).
+    pub fn load(&self, data: Arc<[u8]>, start_paused: bool) -> Result<(), String> {
+        *self.stream.lock().unwrap() = None;
+        let len = data.len() as u64;
+        let decoder = Decoder::builder()
+            .with_data(Cursor::new(data))
+            .with_byte_len(len)
+            .with_hint("m4a")
+            .with_seekable(true)
+            .build()
+            .map_err(|e| format!("no se pudo decodificar el audio: {e}"))?;
+        let player = Player::connect_new(&self.mixer);
+        player.set_volume(*self.volume.lock().unwrap());
+        if start_paused {
+            player.pause();
+        }
+        player.append(Fx::new(decoder, self.fx.clone()));
+        // Al soltar el Player anterior deja de sonar.
+        *self.player.lock().unwrap() = Some(player);
+        Ok(())
+    }
+
+    /// Reproduce lo que librespot vaya dejando en `buf` (canciones de Spotify).
+    pub fn load_stream(&self, buf: Arc<StreamBuf>, start_paused: bool) {
+        let player = Player::connect_new(&self.mixer);
+        player.set_volume(*self.volume.lock().unwrap());
+        if start_paused {
+            player.pause();
+        }
+        let source = StreamSource { buf: buf.clone(), local: Default::default(), ch: 0 };
+        player.append(Fx::new(source, self.fx.clone()));
+        *self.stream.lock().unwrap() = Some(buf);
+        *self.player.lock().unwrap() = Some(player);
+    }
+
+    pub fn stop(&self) {
+        *self.stream.lock().unwrap() = None;
+        *self.player.lock().unwrap() = None;
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&Player) -> T) -> Option<T> {
+        self.player.lock().unwrap().as_ref().map(f)
+    }
+
+    pub fn play(&self) {
+        self.with(|p| p.play());
+    }
+    pub fn pause(&self) {
+        self.with(|p| p.pause());
+    }
+    pub fn is_paused(&self) -> bool {
+        self.with(|p| p.is_paused()).unwrap_or(true)
+    }
+    pub fn has_track(&self) -> bool {
+        self.player.lock().unwrap().is_some()
+    }
+    /// true cuando la cancion cargada ya termino.
+    pub fn finished(&self) -> bool {
+        self.with(|p| p.empty()).unwrap_or(false)
+    }
+    pub fn position(&self) -> f64 {
+        if let Some(b) = self.stream.lock().unwrap().as_ref() {
+            return b.position();
+        }
+        self.with(|p| p.get_pos().as_secs_f64()).unwrap_or(0.0)
+    }
+    pub fn seek(&self, secs: f64) {
+        self.with(|p| {
+            if let Err(e) = p.try_seek(Duration::from_secs_f64(secs.max(0.0))) {
+                log::warn!("seek: {e}");
+            }
+        });
+    }
+    /// `v` en 0..=1 ya con la curva aplicada.
+    pub fn set_volume(&self, v: f32) {
+        *self.volume.lock().unwrap() = v;
+        self.with(|p| p.set_volume(v));
+    }
+}
+
+/// Filtro biquad (formulas del "Audio EQ Cookbook" de R. Bristow-Johnson).
+#[derive(Clone, Copy, Default)]
+struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+}
+
+impl Biquad {
+    fn new(kind: u8, freq: f32, gain_db: f32, sample_rate: f32) -> Self {
+        let freq = freq.min(sample_rate * 0.45);
+        let a = 10f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * freq / sample_rate;
+        let (sin, cos) = w0.sin_cos();
+        let q = 1.0f32;
+        let alpha = sin / (2.0 * q);
+        let (b0, b1, b2, a0, a1, a2) = match kind {
+            // low shelf
+            0 => {
+                let s = 2.0 * a.sqrt() * alpha;
+                (
+                    a * ((a + 1.0) - (a - 1.0) * cos + s),
+                    2.0 * a * ((a - 1.0) - (a + 1.0) * cos),
+                    a * ((a + 1.0) - (a - 1.0) * cos - s),
+                    (a + 1.0) + (a - 1.0) * cos + s,
+                    -2.0 * ((a - 1.0) + (a + 1.0) * cos),
+                    (a + 1.0) + (a - 1.0) * cos - s,
+                )
+            }
+            // high shelf
+            2 => {
+                let s = 2.0 * a.sqrt() * alpha;
+                (
+                    a * ((a + 1.0) + (a - 1.0) * cos + s),
+                    -2.0 * a * ((a - 1.0) + (a + 1.0) * cos),
+                    a * ((a + 1.0) + (a - 1.0) * cos - s),
+                    (a + 1.0) - (a - 1.0) * cos + s,
+                    2.0 * ((a - 1.0) - (a + 1.0) * cos),
+                    (a + 1.0) - (a - 1.0) * cos - s,
+                )
+            }
+            // peaking
+            _ => (
+                1.0 + alpha * a,
+                -2.0 * cos,
+                1.0 - alpha * a,
+                1.0 + alpha / a,
+                -2.0 * cos,
+                1.0 - alpha / a,
+            ),
+        };
+        Self { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0 }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct BiquadState {
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+impl BiquadState {
+    #[inline]
+    fn process(&mut self, f: &Biquad, x: f32) -> f32 {
+        let y = f.b0 * x + f.b1 * self.x1 + f.b2 * self.x2 - f.a1 * self.y1 - f.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+}
+
+const MAX_CH: usize = 8;
+/// Umbral de "silencio" (~ -60 dBFS).
+const SILENCE: f32 = 0.001;
+
+struct Fx<S: Source> {
+    inner: S,
+    fx: Arc<Effects>,
+    channels: usize,
+    sample_rate: f32,
+    ch: usize,
+    counter: u32,
+    version: u32,
+    eq_on: bool,
+    filters: [Biquad; 10],
+    state: Vec<[BiquadState; 10]>,
+    // saltar silencio inicial
+    skipping: bool,
+    skipped_frames: u64,
+    frame: [f32; MAX_CH],
+    pending: usize,
+    pending_len: usize,
+}
+
+impl<S: Source> Fx<S> {
+    fn new(inner: S, fx: Arc<Effects>) -> Self {
+        let channels = (inner.channels().get() as usize).clamp(1, MAX_CH);
+        let sample_rate = inner.sample_rate().get() as f32;
+        let skipping = fx.skip_silence.load(Ordering::Relaxed);
+        let mut me = Self {
+            inner,
+            fx,
+            channels,
+            sample_rate,
+            ch: 0,
+            counter: 0,
+            version: 0,
+            eq_on: false,
+            filters: [Biquad::default(); 10],
+            state: vec![[BiquadState::default(); 10]; channels],
+            skipping,
+            skipped_frames: 0,
+            frame: [0.0; MAX_CH],
+            pending: 0,
+            pending_len: 0,
+        };
+        me.refresh();
+        me
+    }
+
+    fn refresh(&mut self) {
+        self.eq_on = self.fx.eq_enabled.load(Ordering::Relaxed);
+        let v = self.fx.eq_version.load(Ordering::Relaxed);
+        if v != self.version {
+            self.version = v;
+            let gains = *self.fx.eq_gains.lock().unwrap();
+            for (i, f) in EQ_FREQS.iter().enumerate() {
+                let kind = if i == 0 { 0 } else if i == 9 { 2 } else { 1 };
+                self.filters[i] = Biquad::new(kind, *f, gains[i], self.sample_rate);
+            }
+        }
+    }
+
+    #[inline]
+    fn eq(&mut self, s: f32) -> f32 {
+        let ch = self.ch;
+        self.ch = (self.ch + 1) % self.channels;
+        if !self.eq_on {
+            return s;
+        }
+        let mut y = s;
+        let st = &mut self.state[ch];
+        for (i, f) in self.filters.iter().enumerate() {
+            y = st[i].process(f, y);
+        }
+        y.clamp(-1.0, 1.0)
+    }
+}
+
+impl<S: Source> Iterator for Fx<S> {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        self.counter = self.counter.wrapping_add(1);
+        if self.counter % 4096 == 0 {
+            self.refresh();
+        }
+        // Devolver un frame que quedo pendiente al dejar de saltar.
+        if self.pending < self.pending_len {
+            let s = self.frame[self.pending];
+            self.pending += 1;
+            return Some(self.eq(s));
+        }
+        if self.skipping {
+            // Se descartan frames completos (para no desalinear canales), maximo 15 s.
+            let max_frames = (self.sample_rate * 15.0) as u64;
+            loop {
+                let mut loud = false;
+                for c in 0..self.channels {
+                    let s = self.inner.next()?;
+                    self.frame[c] = s;
+                    loud |= s.abs() > SILENCE;
+                }
+                self.skipped_frames += 1;
+                if loud || self.skipped_frames >= max_frames {
+                    self.skipping = false;
+                    self.pending = 1;
+                    self.pending_len = self.channels;
+                    let s = self.frame[0];
+                    return Some(self.eq(s));
+                }
+            }
+        }
+        let s = self.inner.next()?;
+        Some(self.eq(s))
+    }
+}
+
+impl<S: Source> Source for Fx<S> {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> ChannelCount {
+        NonZero::new(self.channels as u16).unwrap()
+    }
+    fn sample_rate(&self) -> SampleRate {
+        self.inner.sample_rate()
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
+    fn try_seek(&mut self, pos: Duration) -> Result<(), rodio::source::SeekError> {
+        self.skipping = false;
+        self.pending_len = 0;
+        self.ch = 0;
+        for st in &mut self.state {
+            *st = [BiquadState::default(); 10];
+        }
+        self.inner.try_seek(pos)
+    }
+}
+
+/// Curva de volumen: lineal o exponencial (plugin exponential-volume de Pear, exponente 3).
+pub fn volume_curve(percent: f32, exponential: bool) -> f32 {
+    let v = (percent / 100.0).clamp(0.0, 1.0);
+    if exponential { v.powi(3) } else { v }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn curva_de_volumen() {
+        assert_eq!(volume_curve(100.0, true), 1.0);
+        assert!((volume_curve(50.0, true) - 0.125).abs() < 1e-6);
+        assert_eq!(volume_curve(50.0, false), 0.5);
+    }
+
+    #[test]
+    fn buffer_de_spotify_entrega_en_orden_y_cuenta_el_tiempo() {
+        let buf = StreamBuf::new();
+        buf.begin_flush(10_000); // la cancion empieza en el segundo 10
+        buf.end_flush();
+        let samples: Vec<f32> = (0..STREAM_RATE as usize * 2).map(|i| i as f32).collect(); // 1 s estereo
+        buf.push(&samples);
+        let mut src = StreamSource { buf: buf.clone(), local: Default::default(), ch: 0 };
+        let got: Vec<f32> = (&mut src).take(samples.len()).collect();
+        assert_eq!(got, samples);
+        assert!((buf.position() - 11.0).abs() < 1e-6);
+        // Sin datos y sin terminar: silencio que no avanza el tiempo.
+        assert_eq!(src.next(), Some(0.0));
+        assert!((buf.position() - 11.0).abs() < 1e-6);
+        // Al terminar la cancion, la fuente se acaba.
+        buf.ended.store(true, Ordering::Relaxed);
+        assert_eq!(src.next(), None);
+    }
+
+    #[test]
+    fn flush_descarta_audio_viejo() {
+        let buf = StreamBuf::new();
+        buf.end_flush();
+        buf.push(&[1.0, 1.0]);
+        buf.begin_flush(0);
+        buf.push(&[2.0, 2.0]); // llega durante el flush: se descarta
+        buf.end_flush();
+        buf.push(&[3.0, 3.0]);
+        let mut src = StreamSource { buf, local: Default::default(), ch: 0 };
+        assert_eq!(src.next(), Some(3.0));
+    }
+
+    #[test]
+    fn eq_plano_no_cambia_la_senal() {
+        let f = Biquad::new(1, 1000.0, 0.0, 44100.0);
+        let mut st = BiquadState::default();
+        for x in [0.5f32, -0.3, 0.1, 0.9] {
+            assert!((st.process(&f, x) - x).abs() < 1e-5);
+        }
+    }
+}

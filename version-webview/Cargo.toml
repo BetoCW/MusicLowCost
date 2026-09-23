@@ -1,0 +1,47 @@
+[package]
+name = "youtube_in_rust_web"
+version = "0.1.0"
+edition = "2024"
+description = "Cliente ligero de YouTube Music en Rust (port de Pear Desktop a Tauri)"
+
+[[bin]]
+name = "YoutubeInRustWeb"
+path = "src/main.rs"
+
+[dependencies]
+discord-rich-presence = "1.1.0"
+log = "0.4.34"
+md-5 = "0.11.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+souvlaki = "0.8.3"
+strsim = "0.11.1"
+tauri = { version = "2.11.6", features = ["tray-icon", "image-png"] }
+tauri-plugin-global-shortcut = "2.3.2"
+tauri-plugin-notification = "2.4.0"
+tauri-plugin-single-instance = "2.4.5"
+tauri-plugin-window-state = "2.4.1"
+tiny_http = "0.12.0"
+tokio = { version = "1.53.1", features = ["time", "sync"] }
+urlencoding = "2.1.3"
+
+# Debe coincidir con la version que usa wry (cargo tree -p wry) para poder
+# hablar con el ICoreWebView2 que crea Tauri.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38.2"
+windows-core = "0.61.2"
+
+[build-dependencies]
+tauri-build = "2.6.3"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

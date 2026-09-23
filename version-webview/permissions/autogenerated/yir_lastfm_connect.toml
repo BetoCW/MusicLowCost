@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-yir-lastfm-connect"
+description = "Enables the yir_lastfm_connect command without any pre-configured scope."
+commands.allow = ["yir_lastfm_connect"]
+
+[[permission]]
+identifier = "deny-yir-lastfm-connect"
+description = "Denies the yir_lastfm_connect command without any pre-configured scope."
+commands.deny = ["yir_lastfm_connect"]

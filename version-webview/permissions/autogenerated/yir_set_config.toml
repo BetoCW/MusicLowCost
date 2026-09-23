@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-yir-set-config"
+description = "Enables the yir_set_config command without any pre-configured scope."
+commands.allow = ["yir_set_config"]
+
+[[permission]]
+identifier = "deny-yir-set-config"
+description = "Denies the yir_set_config command without any pre-configured scope."
+commands.deny = ["yir_set_config"]
