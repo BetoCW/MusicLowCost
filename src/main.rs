@@ -36,7 +36,11 @@ fn main() {
         if let Some(out) = args.get(2) {
 
             #[cfg(windows)]
-            login::run(std::path::PathBuf::from(out));
+            let center = match (args.get(3).and_then(|x| x.parse().ok()), args.get(4).and_then(|y| y.parse().ok())) {
+                (Some(x), Some(y)) => Some((x, y)),
+                _ => None,
+            };
+            login::run(std::path::PathBuf::from(out), center);
         }
         return;
     }

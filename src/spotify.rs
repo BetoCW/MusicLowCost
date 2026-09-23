@@ -61,7 +61,20 @@ pub struct Spotify {
     inner: RefCell<Option<Inner>>,
     token: RefCell<Option<(String, Instant)>>,
     pub user: RefCell<Option<String>>,
+    /// Client ID propio para la Web API (vacio = el compartido de librespot).
+    web_client_id: RefCell<String>,
+    /// Respuestas GET recientes (evita repetir consultas y el limite 429).
+    api_cache: RefCell<std::collections::HashMap<String, (Instant, Value)>>,
+    /// Si Spotify respondio 429, no se consulta hasta esta hora.
+    blocked_until: RefCell<Option<Instant>>,
+    /// Las consultas van de una en una: rafagas en paralelo disparan el 429.
+    api_lock: tokio::sync::Mutex<()>,
 }
+
+/// Cuanto dura una respuesta en cache.
+const API_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+/// Si Spotify pide esperar menos que esto, se espera y reintenta sin mostrar error.
+const MAX_AUTO_WAIT: Duration = Duration::from_secs(60);
 
 pub fn is_spotify(id: &str) -> bool {
     id.starts_with("spotify:")
@@ -71,8 +84,8 @@ fn short_id(uri: &str) -> &str {
     uri.rsplit(':').next().unwrap_or(uri)
 }
 
-fn oauth_client() -> Result<librespot_oauth::OAuthClient, String> {
-    librespot_oauth::OAuthClientBuilder::new(CLIENT_ID, REDIRECT_URI, SCOPES.to_vec())
+fn oauth_client(client_id: &str) -> Result<librespot_oauth::OAuthClient, String> {
+    librespot_oauth::OAuthClientBuilder::new(client_id, REDIRECT_URI, SCOPES.to_vec())
         .open_in_browser()
         .with_custom_message("Listo: ya puedes cerrar esta pestaña y volver a YoutubeInRustWeb.")
         .build()
@@ -88,7 +101,25 @@ impl Spotify {
             inner: RefCell::new(None),
             token: RefCell::new(None),
             user: RefCell::new(None),
+            web_client_id: RefCell::new(String::new()),
+            api_cache: RefCell::new(Default::default()),
+            blocked_until: RefCell::new(None),
+            api_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Client ID propio (opcional) para la Web API. Si cambia, se descarta el token actual.
+    pub fn set_web_client_id(&self, id: &str) {
+        let id = id.trim().to_string();
+        if *self.web_client_id.borrow() != id {
+            *self.web_client_id.borrow_mut() = id;
+            *self.token.borrow_mut() = None;
+            self.api_cache.borrow_mut().clear();
+        }
+    }
+
+    fn web_refresh_path(&self) -> PathBuf {
+        self.cache_dir().join("web-refresh-token")
     }
 
     fn cache_dir(&self) -> PathBuf {
@@ -113,11 +144,23 @@ impl Spotify {
 
     /// Abre el navegador en la pagina oficial de Spotify y espera la autorizacion.
     pub async fn login(&self) -> Result<String, String> {
-        let token = oauth_client()?.get_access_token_async().await.map_err(|e| e.to_string())?;
+        let token = oauth_client(CLIENT_ID)?.get_access_token_async().await.map_err(|e| e.to_string())?;
         let _ = std::fs::create_dir_all(self.cache_dir());
         std::fs::write(self.refresh_path(), &token.refresh_token).map_err(|e| e.to_string())?;
-        *self.token.borrow_mut() = Some((token.access_token.clone(), token.expires_at));
-        self.connect(Credentials::with_access_token(token.access_token)).await?;
+        self.api_cache.borrow_mut().clear();
+        self.connect(Credentials::with_access_token(token.access_token.clone())).await?;
+        let custom = self.web_client_id.borrow().clone();
+        if custom.is_empty() {
+            *self.token.borrow_mut() = Some((token.access_token, token.expires_at));
+        } else {
+            // Segunda autorizacion con el Client ID propio (solo para la Web API).
+            let web = oauth_client(&custom)?
+                .get_access_token_async()
+                .await
+                .map_err(|e| format!("Client ID propio: {e}. Revisa el Redirect URI y la lista de usuarios de tu app."))?;
+            std::fs::write(self.web_refresh_path(), &web.refresh_token).map_err(|e| e.to_string())?;
+            *self.token.borrow_mut() = Some((web.access_token, web.expires_at));
+        }
         self.load_user().await
     }
 
@@ -144,6 +187,25 @@ impl Spotify {
                 format!("No se pudo conectar con Spotify: {msg}")
             }
         })?;
+
+        // El tipo de cuenta llega unos instantes despues de autenticar. Con una cuenta Free
+        // Spotify no entrega el audio: se corta aqui con un mensaje claro.
+        let mut account = None;
+        for _ in 0..30 {
+            account = session.get_user_attribute("type");
+            if account.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if let Some(t) = account.filter(|t| t != "premium") {
+            session.shutdown();
+            log::warn!("Spotify: cuenta de tipo {t:?}");
+            return Err(format!(
+                "Tu cuenta de Spotify es «{t}» (no Premium). Spotify solo permite reproducir fuera de su app con Premium; \
+                 la búsqueda y tus listas sí funcionan, pero no se pueden reproducir."
+            ));
+        }
 
         // Un solo reproductor para toda la sesion (librespot crea sus propios hilos).
         let existing = self.inner.borrow_mut().take();
@@ -198,6 +260,7 @@ impl Spotify {
         }
         *self.token.borrow_mut() = None;
         *self.user.borrow_mut() = None;
+        self.api_cache.borrow_mut().clear();
         let _ = std::fs::remove_dir_all(self.cache_dir());
     }
 
@@ -236,13 +299,20 @@ impl Spotify {
                 return Ok(t.clone());
             }
         }
-        let refresh = std::fs::read_to_string(self.refresh_path()).map_err(|_| "Inicia sesión en Spotify.".to_string())?;
-        let tok = oauth_client()?
+        let custom = self.web_client_id.borrow().clone();
+        let (client, path) = if custom.is_empty() {
+            (CLIENT_ID.to_string(), self.refresh_path())
+        } else {
+            (custom, self.web_refresh_path())
+        };
+        let refresh = std::fs::read_to_string(&path)
+            .map_err(|_| "Inicia sesión en Spotify (Ajustes → Spotify).".to_string())?;
+        let tok = oauth_client(&client)?
             .refresh_token_async(refresh.trim())
             .await
             .map_err(|e| format!("Spotify: la sesión expiró, vuelve a iniciar sesión ({e})"))?;
         if !tok.refresh_token.is_empty() {
-            let _ = std::fs::write(self.refresh_path(), &tok.refresh_token);
+            let _ = std::fs::write(&path, &tok.refresh_token);
         }
         *self.token.borrow_mut() = Some((tok.access_token.clone(), tok.expires_at));
         Ok(tok.access_token)
@@ -250,17 +320,60 @@ impl Spotify {
 
     pub async fn api(&self, path: &str) -> Result<Value, String> {
         let url = if path.starts_with("http") { path.to_string() } else { format!("{API}{path}") };
-        for attempt in 0..2 {
+        if let Some((at, v)) = self.api_cache.borrow().get(&url) {
+            if at.elapsed() < API_CACHE_TTL {
+                return Ok(v.clone());
+            }
+        }
+        let _turn = self.api_lock.lock().await;
+        // Otra consulta pudo haber llenado la cache mientras esperabamos turno.
+        if let Some((at, v)) = self.api_cache.borrow().get(&url) {
+            if at.elapsed() < API_CACHE_TTL {
+                return Ok(v.clone());
+            }
+        }
+        if let Some(until) = *self.blocked_until.borrow() {
+            let now = Instant::now();
+            if now < until {
+                let left = until - now;
+                if left > MAX_AUTO_WAIT {
+                    return Err(rate_limit_msg(left));
+                }
+                tokio::time::sleep(left).await;
+            }
+        }
+        for attempt in 0..3 {
             let token = self.access_token().await?;
             let resp = self.http.get(&url).bearer_auth(&token).send().await.map_err(|e| e.to_string())?;
-            if resp.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            let status = resp.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
                 *self.token.borrow_mut() = None;
                 continue;
             }
-            if !resp.status().is_success() {
-                return Err(format!("Spotify API {}: HTTP {}", path, resp.status()));
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                // Spotify indica cuanto esperar en Retry-After (segundos).
+                let wait = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(30);
+                log::warn!("Spotify 429 en {path}: Retry-After {wait}s");
+                if Duration::from_secs(wait) <= MAX_AUTO_WAIT && attempt < 2 {
+                    // Espera corta: se reintenta solo (la interfaz muestra "Cargando…").
+                    tokio::time::sleep(Duration::from_secs(wait.max(1))).await;
+                    continue;
+                }
+                let d = Duration::from_secs(wait);
+                *self.blocked_until.borrow_mut() = Some(Instant::now() + d);
+                return Err(rate_limit_msg(d));
             }
-            return resp.json().await.map_err(|e| e.to_string());
+            if !status.is_success() {
+                return Err(format!("Spotify API {}: HTTP {}", path, status));
+            }
+            let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+            self.api_cache.borrow_mut().insert(url, (Instant::now(), v.clone()));
+            return Ok(v);
         }
         Err("Spotify API: sin autorización".into())
     }
@@ -310,7 +423,7 @@ impl Spotify {
 
     /// Biblioteca: canciones que te gustan + listas y albumes guardados.
     pub async fn library(&self) -> Result<(Vec<Track>, Vec<Card>), String> {
-        let liked = self.paged("/me/tracks?limit=50", 500).await;
+        let liked = self.paged("/me/tracks?limit=50", 200).await;
         let tracks = liked.iter().filter_map(|i| track(&i["track"])).collect();
         let mut cards: Vec<Card> = self.paged("/me/playlists?limit=50", 100).await.iter().filter_map(playlist_card).collect();
         cards.extend(self.paged("/me/albums?limit=50", 100).await.iter().filter_map(|i| album_card(&i["album"])));
@@ -366,6 +479,14 @@ impl Spotify {
             }
         }
     }
+}
+
+fn rate_limit_msg(d: Duration) -> String {
+    let mins = d.as_secs().div_ceil(60);
+    format!(
+        "Spotify está limitando las consultas (HTTP 429); reintenta en {mins} min. \
+         Si pasa seguido, configura tu propio Client ID en Ajustes → Spotify."
+    )
 }
 
 // ---------- JSON de la Web API -> modelos propios ----------

@@ -39,7 +39,9 @@ Grab `YoutubeInRustWeb-Setup.exe` from the [latest release](https://github.com/B
 
 ## Features
 
-- **YouTube / Spotify switch** in the sidebar: home, search and library follow the active source.
+- **YouTube / Spotify switch** in the sidebar: home, search, library and queue follow the active source,
+  and the accent color changes (red for YouTube Music, green for Spotify). Each source keeps its own
+  queue; the other one is parked and restored when you come back.
 - Home (country charts / recently played), search (songs / albums, artists, playlists), artist,
   album and playlist pages, queue with automatic radio (YouTube Music), shuffle and repeat.
 - Synced lyrics (LRCLIB) or YouTube Music's official lyrics.
@@ -64,6 +66,24 @@ Grab `YoutubeInRustWeb-Setup.exe` from the [latest release](https://github.com/B
   (OAuth). The session is stored in `%APPDATA%\YoutubeInRustWeb\spotify`.
   There is no automatic radio for Spotify (Spotify no longer offers it to third-party apps).
 
+> **Spotify playback requires a Premium account.** Spotify only delivers audio to third-party
+> clients for Premium users. With a Free account you can still sign in, search and browse your
+> playlists, but trying to play shows a clear notice instead of playing.
+
+#### Spotify "HTTP 429 Too Many Requests"
+
+By default the Web API is called with the same Client ID used by librespot and other open-source
+clients, so its rate limit is shared with everyone using them. The app caches responses for 10 minutes
+and honours `Retry-After`, but if you still get 429 errors, use your own Client ID:
+
+1. Go to <https://developer.spotify.com/dashboard> → **Create app**.
+2. Redirect URI: `http://127.0.0.1:8898/login` — API: **Web API**.
+3. In **User Management**, add the email of every Spotify account that will use it (development
+   mode allows up to 25 users).
+4. Copy the **Client ID** into Settings → Spotify → *Client ID propio*, click *Guardar* and sign in again.
+
+Playback itself always goes through librespot and is not affected by this limit.
+
 ## Project layout
 
 ```
@@ -78,6 +98,7 @@ src/desktop.rs            tray, global hotkeys, media overlay (SMTC)
 src/login.rs              Google sign-in window (`--login` process)
 src/integrations/         discord, scrobbler, lyrics (LRCLIB), sponsorblock, local API
 installer/                Inno Setup script
+vendor/librespot-core/    librespot-core 0.8.0 with one change: a Free account no longer calls exit(1)
 version-webview/          previous version (Tauri + WebView2, ~290 MB)
 ```
 

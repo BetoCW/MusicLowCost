@@ -37,6 +37,8 @@ pub struct Config {
     pub logged_in: bool,
     /// Fuente activa: "yt" (YouTube Music) o "sp" (Spotify).
     pub source: String,
+    /// Client ID propio de Spotify para la Web API (opcional; evita el limite 429 compartido).
+    pub spotify_client_id: String,
 }
 
 impl Default for Config {
@@ -70,6 +72,7 @@ impl Default for Config {
             browser: 0,
             logged_in: false,
             source: "yt".into(),
+            spotify_client_id: String::new(),
         }
     }
 }

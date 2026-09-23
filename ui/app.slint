@@ -91,6 +91,10 @@ export global AppState {
     callback sp-logout();
 }
 
+export global Theme {
+    out property <color> accent: AppState.source == "sp" ? #1ed760 : #ff4e45;
+}
+
 export global Cfg {
     in-out property <bool> close-to-tray;
     in-out property <bool> restore-session;
@@ -129,6 +133,7 @@ export global Cfg {
     in-out property <int> browser; // 0 firefox, 1 edge, 2 chrome, 3 brave
     in property <string> account-status;
     in property <string> sp-status;
+    in-out property <string> sp-client-id;
 }
 
 component IconButton inherits Rectangle {
@@ -143,7 +148,7 @@ component IconButton inherits Rectangle {
     background: ta.pressed ? #ffffff33 : ta.has-hover ? #ffffff1a : transparent;
     Text {
         text: root.glyph;
-        color: root.active ? #ff4e45 : #ffffff;
+        color: root.active ? Theme.accent : #ffffff;
         font-size: root.glyph-size;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -237,7 +242,7 @@ component TrackItem inherits Rectangle {
         VerticalLayout {
             alignment: center;
             horizontal-stretch: 3;
-            Text { text: root.item.title; color: root.item.current ? #ff4e45 : #fff; font-size: 14px; overflow: elide; }
+            Text { text: root.item.title; color: root.item.current ? Theme.accent : #fff; font-size: 14px; overflow: elide; }
             Text { text: root.item.artist; color: #aaa; font-size: 12px; overflow: elide; }
         }
         Text { text: root.item.album; color: #aaa; font-size: 12px; overflow: elide; vertical-alignment: center; horizontal-stretch: 2; }
@@ -439,7 +444,7 @@ component Section inherits VerticalLayout {
     in property <string> title;
     spacing: 6px;
     padding-bottom: 14px;
-    Text { text: root.title; color: #ff4e45; font-size: 15px; font-weight: 700; }
+    Text { text: root.title; color: Theme.accent; font-size: 15px; font-weight: 700; }
     @children
 }
 
@@ -505,6 +510,16 @@ component SettingsPage inherits VerticalLayout {
                     alignment: start;
                     Button { text: "Iniciar sesión con Spotify"; clicked => { AppState.sp-login(); } }
                     if AppState.sp-logged: Button { text: "Cerrar sesión"; clicked => { AppState.sp-logout(); } }
+                }
+                Field {
+                    label: "Client ID propio (opcional)";
+                    LineEdit { placeholder-text: "Vacío = el compartido"; text <=> Cfg.sp-client-id; }
+                }
+                Text {
+                    text: "Si aparece «HTTP 429», Spotify está limitando el Client ID compartido. Crea el tuyo gratis en developer.spotify.com/dashboard → Create app (Redirect URI: http://127.0.0.1:8898/login, API: Web API) y en «User Management» agrega el correo de cada cuenta que la use. Pega el Client ID aquí, pulsa Guardar y vuelve a iniciar sesión.";
+                    color: #777;
+                    font-size: 12px;
+                    wrap: word-wrap;
                 }
             }
             Section {
@@ -591,7 +606,7 @@ component ProgressBar inherits Rectangle {
             x: 0;
             width: parent.width * (root.drag-fraction >= 0 ? root.drag-fraction : clamp(root.fraction, 0, 1));
             border-radius: 3px;
-            background: #ff4e45;
+            background: Theme.accent;
         }
     }
     ta := TouchArea {
@@ -768,8 +783,6 @@ export component AppWindow inherits Window {
 
 // Ventana del proceso `--login` (el WebView de Google se dibuja encima).
 export component LoginWindow inherits Window {
-    // Siempre encima: si no, Windows a veces la abre detras de otras ventanas.
-    always-on-top: true;
     title: "Iniciar sesión — YoutubeInRustWeb";
     icon: @image-url("../icons/icon.png");
     preferred-width: 520px;

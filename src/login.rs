@@ -39,7 +39,8 @@ fn bounds(w: &LoginWindow) -> Rect {
 }
 
 /// Punto de entrada del proceso `--login`.
-pub fn run(out: PathBuf) {
+/// `center`: centro (en pixeles de pantalla) de la ventana principal, para abrir encima de ella.
+pub fn run(out: PathBuf, center: Option<(i32, i32)>) {
     let _ = std::fs::remove_file(crate::config::data_dir().join("login.log"));
     let window = match LoginWindow::new() {
         Ok(w) => w,
@@ -56,6 +57,12 @@ pub fn run(out: PathBuf) {
         let (weak, ctx, webview) = (window.as_weak(), ctx.clone(), webview.clone());
         slint::Timer::single_shot(Duration::from_millis(100), move || {
             let Some(w) = weak.upgrade() else { return };
+            if let Some((cx, cy)) = center {
+                let size = w.window().size();
+                let x = cx - size.width as i32 / 2;
+                let y = (cy - size.height as i32 / 2).max(0);
+                w.window().set_position(slint::PhysicalPosition::new(x, y));
+            }
             let handle = w.window().window_handle();
             let mut ctx = ctx.borrow_mut();
             match WebViewBuilder::new_with_web_context(&mut ctx)

@@ -1,6 +1,6 @@
 [package]
 name = "youtube_in_rust_web"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [[bin]]
@@ -45,3 +45,8 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# librespot-core con un cambio: una cuenta Free ya no termina el proceso (exit(1)),
+# la app lo detecta y avisa. Ver vendor/librespot-core/src/session.rs.
+[patch.crates-io]
+librespot-core = { path = "vendor/librespot-core" }
