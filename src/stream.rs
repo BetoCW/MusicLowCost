@@ -5,14 +5,18 @@
 //! segundos por cancion y se cierra; la descarga y la reproduccion son 100% Rust.
 //!
 //! La app es autosuficiente: si no encuentra yt-dlp lo descarga a su propia carpeta
-//! (%APPDATA%\YoutubeInRustWeb\bin). yt-dlp necesita un motor de JavaScript para
+//! (%APPDATA%\YoutubeInRustWeb\bin\yt-dlp). yt-dlp necesita un motor de JavaScript para
 //! descifrar YouTube: se usa Node si esta instalado y, si no, se descarga deno ahi mismo.
+//!
+//! Se usa la version "en carpeta" de yt-dlp (yt-dlp_win.zip) y no el yt-dlp.exe de un
+//! solo archivo: ese se desempaqueta en cada ejecucion y tarda ~2.5 s extra por cancion.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const YTDLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
+const YTDLP_ZIP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_win.zip";
+const YTDLP_LATEST_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest";
 const DENO_URL: &str = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip";
 
 pub struct Resolved {
@@ -45,6 +49,14 @@ pub fn bin_dir() -> PathBuf {
     crate::config::data_dir().join("bin")
 }
 
+/// Carpeta con la copia propia de yt-dlp (version en carpeta).
+fn own_ytdlp_dir() -> PathBuf {
+    bin_dir().join("yt-dlp")
+}
+
+/// Mientras se reemplaza la carpeta de yt-dlp no se puede ejecutar (y viceversa).
+static YTDLP_SWAP: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 fn in_path(exe: &str) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(d) = std::env::var_os("LOCALAPPDATA") {
@@ -59,11 +71,8 @@ fn in_path(exe: &str) -> Option<PathBuf> {
 
 fn find_tools() -> (Option<(PathBuf, bool)>, Option<(&'static str, PathBuf)>) {
     let bin = bin_dir();
-    let ytdlp = if bin.join("yt-dlp.exe").is_file() {
-        Some((bin.join("yt-dlp.exe"), true))
-    } else {
-        in_path("yt-dlp.exe").map(|p| (p, false))
-    };
+    let own = own_ytdlp_dir().join("yt-dlp.exe");
+    let ytdlp = if own.is_file() { Some((own, true)) } else { in_path("yt-dlp.exe").map(|p| (p, false)) };
     let js = if bin.join("deno.exe").is_file() {
         Some(("deno", bin.join("deno.exe")))
     } else if let Some(p) = in_path("deno.exe") {
@@ -88,6 +97,51 @@ async fn download_file(http: &reqwest::Client, url: &str, dest: &Path) -> Result
     std::fs::rename(&tmp, dest).map_err(|e| e.to_string())
 }
 
+/// Descomprime un .zip con el tar de Windows 10/11 (sin librerias extra).
+fn unzip(zip: &Path, dest: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    let mut cmd = Command::new("tar");
+    cmd.arg("-xf").arg(zip).arg("-C").arg(dest);
+    no_window(&mut cmd);
+    match cmd.status() {
+        Ok(s) if s.success() => Ok(()),
+        _ => Err(format!("no se pudo descomprimir {}", zip.display())),
+    }
+}
+
+/// Descarga la ultima version en carpeta de yt-dlp y reemplaza la copia propia.
+async fn install_ytdlp(http: &reqwest::Client) -> Result<(), String> {
+    let bin = bin_dir();
+    std::fs::create_dir_all(&bin).map_err(|e| e.to_string())?;
+    let zip = bin.join("yt-dlp_win.zip");
+    download_file(http, YTDLP_ZIP_URL, &zip).await?;
+    tokio::task::spawn_blocking(move || {
+        let fresh = bin.join("yt-dlp.new");
+        let old = bin.join("yt-dlp.old");
+        let _ = std::fs::remove_dir_all(&fresh);
+        let _ = std::fs::remove_dir_all(&old);
+        let r = unzip(&zip, &fresh);
+        let _ = std::fs::remove_file(&zip);
+        r?;
+        if !fresh.join("yt-dlp.exe").is_file() {
+            return Err("el zip de yt-dlp no trae yt-dlp.exe".to_string());
+        }
+        let _guard = YTDLP_SWAP.write().unwrap_or_else(|e| e.into_inner());
+        let dir = own_ytdlp_dir();
+        // Renombrar falla completo (sin dejar nada a medias) si algun archivo esta en uso.
+        if dir.exists() {
+            std::fs::rename(&dir, &old).map_err(|e| format!("yt-dlp en uso: {e}"))?;
+        }
+        std::fs::rename(&fresh, &dir).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_dir_all(&old);
+        // Copia vieja de un solo archivo (lenta): ya no se usa.
+        let _ = std::fs::remove_file(bin.join("yt-dlp.exe"));
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Localiza (o descarga la primera vez) yt-dlp y un motor de JavaScript.
 /// `status` recibe mensajes para mostrar en la interfaz.
 pub async fn ensure_tools(http: &reqwest::Client, status: impl Fn(&str)) -> Result<Tools, String> {
@@ -105,22 +159,27 @@ pub async fn ensure_tools(http: &reqwest::Client, status: impl Fn(&str)) -> Resu
     if ytdlp.is_none() || js.is_none() {
         std::fs::create_dir_all(&bin).map_err(|e| e.to_string())?;
     }
-    if ytdlp.is_none() {
+    // Sin yt-dlp, o con la copia propia vieja de un solo archivo: bajar la version en carpeta.
+    let old_single = bin.join("yt-dlp.exe");
+    if ytdlp.is_none() || old_single.is_file() {
         status("Descargando yt-dlp (solo la primera vez, ~18 MB)…");
-        log::info!("descargando yt-dlp a {}", bin.display());
-        download_file(http, YTDLP_URL, &bin.join("yt-dlp.exe")).await?;
-        ytdlp = Some((bin.join("yt-dlp.exe"), true));
+        log::info!("descargando yt-dlp a {}", own_ytdlp_dir().display());
+        match install_ytdlp(http).await {
+            Ok(()) => ytdlp = Some((own_ytdlp_dir().join("yt-dlp.exe"), true)),
+            // Si falla pero hay una copia de antes, se sigue usando esa.
+            Err(e) if ytdlp.is_some() || old_single.is_file() => {
+                log::warn!("no se pudo instalar yt-dlp en carpeta: {e}");
+                ytdlp = ytdlp.or(Some((old_single, false)));
+            }
+            Err(e) => return Err(e),
+        }
     }
     if js.is_none() {
         status("Descargando deno para yt-dlp (solo la primera vez, ~45 MB)…");
         log::info!("descargando deno a {}", bin.display());
         let zip = bin.join("deno.zip");
         download_file(http, DENO_URL, &zip).await?;
-        // tar de Windows 10/11 descomprime .zip sin librerias extra.
-        let mut cmd = Command::new("tar");
-        cmd.arg("-xf").arg(&zip).arg("-C").arg(&bin);
-        no_window(&mut cmd);
-        let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+        let ok = unzip(&zip, &bin).is_ok();
         let _ = std::fs::remove_file(&zip);
         if !ok || !bin.join("deno.exe").is_file() {
             return Err("no se pudo descomprimir deno".into());
@@ -157,7 +216,8 @@ pub fn ytdlp_command() -> Result<Command, String> {
 
 /// Actualiza la copia propia de yt-dlp como mucho una vez cada 3 dias
 /// (YouTube cambia seguido y las versiones viejas dejan de funcionar).
-pub fn maybe_self_update() {
+/// La version en carpeta no se actualiza con `-U`: si hay una nueva se vuelve a bajar.
+pub async fn maybe_self_update(http: &reqwest::Client) {
     let Some(t) = cached_tools() else { return };
     if !t.own_ytdlp {
         return;
@@ -172,13 +232,30 @@ pub fn maybe_self_update() {
     if recent {
         return;
     }
-    let _ = std::fs::write(&stamp, b"");
-    let mut cmd = Command::new(&t.ytdlp);
-    cmd.args(["-U", "--no-warnings"]);
-    no_window(&mut cmd);
-    match cmd.output() {
-        Ok(o) => log::info!("yt-dlp -U: {}", String::from_utf8_lossy(&o.stdout).lines().last().unwrap_or("")),
-        Err(e) => log::warn!("yt-dlp -U: {e}"),
+    // .../releases/latest redirige a .../releases/tag/<version>
+    let latest = match http.head(YTDLP_LATEST_URL).send().await {
+        Ok(r) => r.url().path_segments().and_then(|mut s| s.next_back()).unwrap_or("").to_string(),
+        Err(e) => return log::warn!("yt-dlp: no se pudo consultar la ultima version: {e}"),
+    };
+    let ytdlp = t.ytdlp.clone();
+    let current = tokio::task::spawn_blocking(move || {
+        let mut cmd = Command::new(ytdlp);
+        cmd.arg("--version");
+        no_window(&mut cmd);
+        cmd.output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+    if latest.is_empty() || latest == current {
+        let _ = std::fs::write(&stamp, b"");
+        return;
+    }
+    log::info!("actualizando yt-dlp {current} -> {latest}");
+    match install_ytdlp(http).await {
+        Ok(()) => {
+            let _ = std::fs::write(&stamp, b"");
+        }
+        Err(e) => log::warn!("actualizar yt-dlp: {e}"),
     }
 }
 
@@ -190,6 +267,7 @@ pub fn resolve(video_id: &str, low_quality: bool) -> Result<Resolved, String> {
     } else {
         "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]"
     };
+    let _guard = YTDLP_SWAP.read().unwrap_or_else(|e| e.into_inner());
     let out = ytdlp_command()?
         .args([
             "-f",

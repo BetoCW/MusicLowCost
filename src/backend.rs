@@ -23,6 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+mod jam_link;
+use jam_link::Jam;
+
 #[derive(Debug)]
 pub enum Cmd {
     Navigate(String),
@@ -52,6 +55,13 @@ pub enum Cmd {
     SetSource(String),
     SpotifyLogin,
     SpotifyLogout,
+    /// Crear un Jam: nombre, puerto.
+    JamHost(String, u16),
+    /// Unirse a un Jam: nombre, direccion, codigo.
+    JamJoin(String, String, String),
+    JamLeave,
+    /// Aviso del Jam con ese id.
+    Jam(u32, crate::jam::Event),
 }
 
 /// Se guarda en session.json para retomar la cola al abrir.
@@ -109,6 +119,8 @@ struct State {
     last_paused: bool,
     errors_in_row: u32,
     last_snapshot: Instant,
+    /// Canciones que agregaron invitados del Jam (se ponen en orden de llegada).
+    jam_added: std::collections::HashSet<String>,
 }
 
 pub struct Backend {
@@ -126,6 +138,7 @@ pub struct Backend {
     api_enabled: Arc<AtomicBool>,
     api_started: RefCell<bool>,
     spotify: Spotify,
+    jam: RefCell<Jam>,
 }
 
 type B = Rc<Backend>;
@@ -166,6 +179,7 @@ pub fn run(
             api_enabled: Arc::new(AtomicBool::new(cfg.api_server)),
             api_started: RefCell::new(false),
             spotify,
+            jam: RefCell::new(Jam::Off),
             state: RefCell::new(State {
                 shuffle: false,
                 repeat: 0,
@@ -196,6 +210,7 @@ pub fn run(
                 last_paused: true,
                 errors_in_row: 0,
                 last_snapshot: Instant::now(),
+                jam_added: Default::default(),
                 cfg,
             }),
         });
@@ -225,7 +240,7 @@ pub fn run(
                 match stream::ensure_tools(&b2.http, move |m| ui.status(m)).await {
                     Ok(_) => {
                         b2.ui.status("");
-                        let _ = tokio::task::spawn_blocking(stream::maybe_self_update).await;
+                        stream::maybe_self_update(&b2.http).await;
                     }
                     Err(e) => b2.ui.status(format!("No se pudo preparar yt-dlp: {e}")),
                 }
@@ -299,6 +314,9 @@ impl Backend {
     }
 
     fn handle(self: &Rc<Self>, cmd: Cmd) {
+        if self.jam_intercept(&cmd) {
+            return;
+        }
         match cmd {
             Cmd::Navigate(page) => {
                 if page == "library" && (self.cfg().logged_in || self.is_spotify_source()) {
@@ -372,11 +390,15 @@ impl Backend {
             Cmd::Previous => {
                 if self.engine.position() > 3.0 {
                     self.engine.seek(0.0);
+                    self.on_play_state();
                 } else {
                     let idx = self.state.borrow().index;
                     match idx {
                         Some(i) if i > 0 => self.play_index(i - 1, true),
-                        _ => self.engine.seek(0.0),
+                        _ => {
+                            self.engine.seek(0.0);
+                            self.on_play_state();
+                        }
                     }
                 }
             }
@@ -468,6 +490,9 @@ impl Backend {
                     cfg.lastfm.secret = st.cfg.lastfm.secret.clone();
                     cfg.logged_in = st.cfg.logged_in;
                     cfg.source = st.cfg.source.clone();
+                    cfg.jam_name = st.cfg.jam_name.clone();
+                    cfg.jam_port = st.cfg.jam_port;
+                    cfg.jam_last_address = st.cfg.jam_last_address.clone();
                     st.cfg = cfg;
                 }
                 config::save(&self.dir, &self.cfg());
@@ -512,6 +537,10 @@ impl Backend {
                     self.set_cards(CardListKind::Library, vec![]);
                 }
             }
+            Cmd::JamHost(name, port) => self.jam_start_host(name, port),
+            Cmd::JamJoin(name, addr, code) => self.jam_join(name, addr, code),
+            Cmd::JamLeave => self.jam_leave(None),
+            Cmd::Jam(id, ev) => self.jam_event(id, ev),
         }
     }
 
@@ -520,7 +549,7 @@ impl Backend {
     fn apply_settings(self: &Rc<Self>, first: bool) {
         let cfg = self.cfg();
         self.engine.fx.set_eq(cfg.eq_enabled, cfg.eq);
-        self.engine.fx.skip_silence.store(cfg.skip_silence, Ordering::Relaxed);
+        self.sync_fx();
         self.engine.set_volume(volume_curve(cfg.volume, cfg.exponential_volume));
         self.spotify.set_web_client_id(&cfg.spotify_client_id);
         if !cfg.discord {
@@ -596,6 +625,7 @@ impl Backend {
         let current = self.state.borrow().current.as_ref().map(|t| t.id.clone());
         self.state.borrow_mut().lists.insert(ListKind::Queue, queue.clone());
         self.show_tracks(ListKind::Queue, queue, current);
+        self.jam_host_queue();
     }
 
     fn clear_prefetch(&self) {
@@ -616,6 +646,7 @@ impl Backend {
             st.buffering = true;
             (t, st.play_seq)
         };
+        self.jam_host_hold();
         self.engine.stop();
         self.spotify.stop();
         self.start_track_ui(&track);
@@ -697,6 +728,8 @@ impl Backend {
                 if self.engine.load(data, false).is_ok() {
                     self.state.borrow_mut().listened = 0.0;
                     self.state.borrow_mut().scrobbled = false;
+                    // Los invitados ya tienen el audio: solo vuelven al principio.
+                    self.jam_host_state();
                     return;
                 }
             }
@@ -740,6 +773,7 @@ impl Backend {
             desktop::set_now_playing(cur.as_ref(), paused);
         });
         self.update_discord();
+        self.jam_host_state();
     }
 
     fn update_discord(&self) {
@@ -860,7 +894,12 @@ impl Backend {
         let session = Session {
             queue: st.queue.iter().take(300).cloned().collect(),
             index: st.index,
-            position: if self.engine.has_track() { self.engine.position() } else { st.restore_position.unwrap_or(0.0) },
+            // De invitado en un Jam lo que suena no es tu cola: se guarda donde ibas.
+            position: if self.engine.has_track() && !self.is_jam_guest() {
+                self.engine.position()
+            } else {
+                st.restore_position.unwrap_or(0.0)
+            },
             active_sp: st.active_sp,
             other: st.parked.0.iter().take(300).cloned().collect(),
             other_index: st.parked.1,
@@ -961,6 +1000,8 @@ async fn load_and_play(b: B, track: Track, seq: u64, autoplay: bool) {
         }
         b.engine.load_stream(b.spotify.buf.clone(), !autoplay);
         b.state.borrow_mut().current_data = None;
+        // El audio de Spotify no se reparte: los invitados solo ven que cancion es.
+        b.jam_host_track(&track, None);
     } else {
         let pre = {
             let mut st = b.state.borrow_mut();
@@ -991,6 +1032,7 @@ async fn load_and_play(b: B, track: Track, seq: u64, autoplay: bool) {
         if let Some(pos) = restore {
             b.engine.seek(pos);
         }
+        b.jam_host_track(&track, Some(data.clone()));
         b.state.borrow_mut().current_data = Some(data);
     }
     {
@@ -1440,14 +1482,25 @@ async fn ticker(b: B) {
         if save_counter % 60 == 0 {
             b.save_session();
         }
+        let guest = b.is_jam_guest();
+        if guest {
+            b.jam_guest_sync(false);
+        }
         if !b.engine.has_track() || b.state.borrow().buffering {
             continue;
+        }
+        if !guest && save_counter % 8 == 0 {
+            // Latido del Jam cada 2 s (por si a un invitado se le paso algun cambio).
+            b.jam_host_state();
         }
         let paused = b.engine.is_paused();
         let pos = b.engine.position();
 
         if b.engine.finished() {
-            b.next(false);
+            // El invitado no avanza solo: espera la siguiente cancion del anfitrion.
+            if !guest {
+                b.next(false);
+            }
             continue;
         }
         if paused != b.state.borrow().last_paused {
@@ -1458,6 +1511,7 @@ async fn ticker(b: B) {
         let skip_to = b.state.borrow().segments.iter().find(|s| pos >= s[0] && pos < s[1] - 0.5).map(|s| s[1]);
         if let Some(to) = skip_to {
             b.engine.seek(to);
+            b.jam_host_state();
         }
 
         let (lyric_idx, changed, scrobble) = {
@@ -1530,7 +1584,6 @@ fn shuffle_vec<T>(v: &mut [T]) {
 /// Copia la configuracion a la pantalla de ajustes.
 pub fn push_cfg_to_ui(ui: &crate::AppWindow, cfg: &Config) {
     let c = ui.global::<Cfg>();
-    c.set_close_to_tray(cfg.close_to_tray);
     c.set_restore_session(cfg.restore_session);
     c.set_autoplay_radio(cfg.autoplay_radio);
     c.set_notifications(cfg.notifications);
@@ -1574,13 +1627,15 @@ pub fn push_cfg_to_ui(ui: &crate::AppWindow, cfg: &Config) {
     s.set_source(if cfg.source == "sp" { "sp".into() } else { "yt".into() });
     c.set_sp_status("Sin sesión de Spotify".into());
     s.set_logged_in(cfg.logged_in);
+    s.set_jam_name(cfg.jam_name.clone().into());
+    s.set_jam_port(cfg.jam_port as i32);
+    s.set_jam_join_address(cfg.jam_last_address.clone().into());
 }
 
 /// Lee la pantalla de ajustes a un Config.
 pub fn read_cfg_from_ui(ui: &crate::AppWindow) -> Config {
     let c = ui.global::<Cfg>();
     let mut cfg = Config {
-        close_to_tray: c.get_close_to_tray(),
         restore_session: c.get_restore_session(),
         autoplay_radio: c.get_autoplay_radio(),
         notifications: c.get_notifications(),

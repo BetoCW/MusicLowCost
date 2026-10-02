@@ -193,6 +193,59 @@ pub fn init(
     std::mem::forget(timer);
 }
 
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetForegroundWindow() -> isize;
+    fn IsIconic(hwnd: isize) -> i32;
+    fn IsWindowVisible(hwnd: isize) -> i32;
+    fn GetSystemMetrics(index: i32) -> i32;
+    fn RedrawWindow(hwnd: isize, rect: *const std::ffi::c_void, rgn: isize, flags: u32) -> i32;
+}
+
+/// El renderer por software solo repinta lo que cambio y reutiliza el resto del buffer.
+/// Un juego en pantalla completa (cambio de resolucion / modo exclusivo) borra ese buffer
+/// sin que la app se entere, y al volver con Alt+Tab la ventana queda con basura.
+/// Cada vez que cambia la ventana en primer plano o la resolucion, se repinta todo
+/// (tambien el marco de Windows) durante ~1 s, porque el juego tarda en soltar la pantalla.
+#[cfg(windows)]
+pub fn watch_repaint(weak: slint::Weak<crate::AppWindow>, hwnd: Option<isize>) {
+    let Some(hwnd) = hwnd else { return };
+    const SM_CXSCREEN: i32 = 0;
+    const SM_CYSCREEN: i32 = 1;
+    const RDW_INVALIDATE: u32 = 0x0001;
+    const RDW_ERASE: u32 = 0x0004;
+    const RDW_FRAME: u32 = 0x0400;
+    let screen = || unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    let mut last_fg = unsafe { GetForegroundWindow() };
+    let mut last_screen = screen();
+    let mut pending = 0u8;
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, Duration::from_millis(250), move || {
+        let fg = unsafe { GetForegroundWindow() };
+        let scr = screen();
+        if fg != last_fg || scr != last_screen {
+            last_fg = fg;
+            last_screen = scr;
+            pending = 4;
+        }
+        if pending == 0 {
+            return;
+        }
+        pending -= 1;
+        if unsafe { IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 } {
+            return;
+        }
+        if let Some(ui) = weak.upgrade() {
+            use slint::ComponentHandle;
+            ui.set_repaint_flip(!ui.get_repaint_flip());
+            ui.window().request_redraw();
+        }
+        unsafe { RedrawWindow(hwnd, std::ptr::null(), 0, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME) };
+    });
+    std::mem::forget(timer);
+}
+
 pub fn apply_shortcuts(cfg: &Config) {
     DESKTOP.with(|d| {
         let mut d = d.borrow_mut();

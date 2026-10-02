@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Config {
-    pub close_to_tray: bool,
     pub restore_session: bool,
     pub autoplay_radio: bool,
     pub notifications: bool,
@@ -39,12 +38,17 @@ pub struct Config {
     pub source: String,
     /// Client ID propio de Spotify para la Web API (opcional; evita el limite 429 compartido).
     pub spotify_client_id: String,
+    /// Nombre con el que te ven en un Jam.
+    pub jam_name: String,
+    /// Puerto que abre el anfitrion de un Jam.
+    pub jam_port: u16,
+    /// Ultima direccion a la que te uniste.
+    pub jam_last_address: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            close_to_tray: true,
             restore_session: true,
             autoplay_radio: true,
             notifications: false,
@@ -73,6 +77,9 @@ impl Default for Config {
             logged_in: false,
             source: "yt".into(),
             spotify_client_id: String::new(),
+            jam_name: std::env::var("USERNAME").unwrap_or_default(),
+            jam_port: crate::jam::DEFAULT_PORT,
+            jam_last_address: String::new(),
         }
     }
 }

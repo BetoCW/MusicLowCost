@@ -42,14 +42,19 @@ impl Images {
             return Some(p);
         }
         let bytes = self.http.get(url).send().await.ok()?.bytes().await.ok()?;
-        let img = image::load_from_memory(&bytes).ok()?;
-        let img = if img.width() > size || img.height() > size {
-            img.thumbnail(size, size)
-        } else {
-            img
-        };
-        let rgba = img.to_rgba8();
-        let pixels = Pixels::clone_from_slice(rgba.as_raw(), rgba.width(), rgba.height());
+        // Decodificar fuera del hilo de trabajo para no retrasar los comandos (play, siguiente…).
+        let pixels = tokio::task::spawn_blocking(move || {
+            let img = image::load_from_memory(&bytes).ok()?;
+            let img = if img.width() > size || img.height() > size {
+                img.thumbnail(size, size)
+            } else {
+                img
+            };
+            let rgba = img.to_rgba8();
+            Some(Pixels::clone_from_slice(rgba.as_raw(), rgba.width(), rgba.height()))
+        })
+        .await
+        .ok()??;
         self.insert(url.to_string(), pixels.clone());
         Some(pixels)
     }

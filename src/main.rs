@@ -9,6 +9,7 @@ mod config;
 mod desktop;
 mod images;
 mod integrations;
+mod jam;
 mod logger;
 #[cfg(windows)]
 mod login;
@@ -85,15 +86,12 @@ fn main() {
             .expect("hilo backend");
     }
 
-    // Cerrar = ir a la bandeja (configurable).
+    // La X cierra la app (para esconderla sin salir: atajo o menu de la bandeja).
     {
-        let (weak, tx, visible) = (ui.as_weak(), tx.clone(), visible.clone());
+        let (tx, visible) = (tx.clone(), visible.clone());
         ui.window().on_close_requested(move || {
-            let to_tray = weak.upgrade().map(|u| u.global::<Cfg>().get_close_to_tray()).unwrap_or(true);
             visible.store(false, Ordering::Relaxed);
-            if !to_tray {
-                quit(&tx);
-            }
+            quit(&tx);
             slint::CloseRequestResponse::HideWindow
         });
     }
@@ -137,8 +135,14 @@ fn main() {
     let quit_tx = tx.clone();
     desktop::init(tx.clone(), hwnd, toggle, move || quit(&quit_tx));
     desktop::apply_shortcuts(&cfg);
+    #[cfg(windows)]
+    desktop::watch_repaint(ui.as_weak(), hwnd);
 
     slint::run_event_loop_until_quit().expect("error en el bucle de eventos");
+    // Hay hilos que nunca terminan (salida de audio, backend, API local): se termina el
+    // proceso aqui en vez de esperar a que se suelte todo.
+    log::info!("saliendo");
+    std::process::exit(0);
 }
 
 fn quit(tx: &tokio::sync::mpsc::UnboundedSender<Cmd>) {
@@ -218,4 +222,10 @@ fn wire_callbacks(ui: &AppWindow, tx: &tokio::sync::mpsc::UnboundedSender<Cmd>) 
     s.on_sp_login(move || send!(t, Cmd::SpotifyLogin));
     let t = tx.clone();
     s.on_sp_logout(move || send!(t, Cmd::SpotifyLogout));
+    let t = tx.clone();
+    s.on_jam_host(move |name, port| send!(t, Cmd::JamHost(name.to_string(), port.clamp(1024, 65535) as u16)));
+    let t = tx.clone();
+    s.on_jam_join(move |name, addr, code| send!(t, Cmd::JamJoin(name.to_string(), addr.to_string(), code.to_string())));
+    let t = tx.clone();
+    s.on_jam_leave(move || send!(t, Cmd::JamLeave));
 }

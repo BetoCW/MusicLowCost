@@ -65,6 +65,19 @@ export global AppState {
     in property <int> lyrics-current: -1;
     in property <string> lyrics-status;
 
+    // Jam
+    in property <string> jam-role: "off"; // "off" | "host" | "guest"
+    in property <string> jam-status;
+    in property <string> jam-sync;
+    in property <string> jam-code;
+    in property <string> jam-address;
+    in property <[string]> jam-peers;
+    in property <[string]> jam-queue;
+    in-out property <string> jam-name;
+    in-out property <int> jam-port: 26541;
+    in-out property <string> jam-join-address;
+    in-out property <string> jam-join-code;
+
     callback navigate(string);
     callback search(string);
     callback play-track(string, int); // lista, indice
@@ -89,6 +102,9 @@ export global AppState {
     callback set-source(string);
     callback sp-login();
     callback sp-logout();
+    callback jam-host(string, int); // nombre, puerto
+    callback jam-join(string, string, string); // nombre, direccion, codigo
+    callback jam-leave();
 }
 
 export global Theme {
@@ -96,7 +112,6 @@ export global Theme {
 }
 
 export global Cfg {
-    in-out property <bool> close-to-tray;
     in-out property <bool> restore-session;
     in-out property <bool> autoplay-radio;
     in-out property <bool> notifications;
@@ -483,7 +498,6 @@ component SettingsPage inherits VerticalLayout {
             padding-right: 16px;
             Section {
                 title: "General";
-                Switch { text: "Cerrar a la bandeja en vez de salir"; checked <=> Cfg.close-to-tray; }
                 Switch { text: "Recordar la cola al abrir (sin reproducir sola)"; checked <=> Cfg.restore-session; }
                 Switch { text: "Al terminar la cola, seguir con canciones parecidas (radio)"; checked <=> Cfg.autoplay-radio; }
                 Switch { text: "Notificación al cambiar de canción"; checked <=> Cfg.notifications; }
@@ -587,6 +601,89 @@ component SettingsPage inherits VerticalLayout {
             }
         }
     }
+}
+
+component Hint inherits Text {
+    color: #777;
+    font-size: 12px;
+    wrap: word-wrap;
+}
+
+component JamPage inherits VerticalLayout {
+    spacing: 12px;
+    HorizontalLayout {
+        PageTitle { text: "Jam"; }
+        Rectangle { }
+        if AppState.jam-role != "off": Button {
+            text: AppState.jam-role == "host" ? "Terminar Jam" : "Salir del Jam";
+            clicked => { AppState.jam-leave(); }
+        }
+    }
+    Text {
+        text: "Escuchen lo mismo al mismo tiempo. El anfitrión descarga cada canción una sola vez y se la pasa a los demás; solo se comparte el audio de YouTube Music.";
+        color: #aaa;
+        wrap: word-wrap;
+    }
+    if AppState.jam-status != "": Text { text: AppState.jam-status; color: #ffb74d; wrap: word-wrap; }
+    if AppState.jam-role == "guest" && AppState.jam-sync != "": Hint { text: AppState.jam-sync; }
+
+    if AppState.jam-role == "off": ScrollView {
+        vertical-stretch: 1;
+        VerticalLayout {
+            padding-right: 16px;
+            Section {
+                title: "Tu nombre";
+                LineEdit { placeholder-text: "Cómo te ven los demás"; text <=> AppState.jam-name; }
+            }
+            Section {
+                title: "Crear un Jam";
+                Field { label: "Puerto"; SpinBox { minimum: 1024; maximum: 65535; value <=> AppState.jam-port; } }
+                Hint {
+                    text: "Los invitados se conectan a tu PC en la misma red (o por una VPN como Tailscale o ZeroTier). Para invitar por internet, abre ese puerto en tu router. Windows puede pedirte permiso en el firewall: acéptalo para redes privadas.";
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    Button { text: "Crear Jam"; primary: true; clicked => { AppState.jam-host(AppState.jam-name, AppState.jam-port); } }
+                }
+            }
+            Section {
+                title: "Unirse a un Jam";
+                Field { label: "Dirección (IP:puerto)"; LineEdit { placeholder-text: "192.168.1.20:26541"; text <=> AppState.jam-join-address; } }
+                Field { label: "Código"; LineEdit { placeholder-text: "ABC123"; text <=> AppState.jam-join-code; } }
+                Hint { text: "Mientras estés en el Jam, lo que toques se agrega a la cola del anfitrión y los controles del reproductor le piden a él pausar, saltar o adelantar."; }
+                HorizontalLayout {
+                    alignment: start;
+                    Button {
+                        text: "Unirse";
+                        primary: true;
+                        clicked => { AppState.jam-join(AppState.jam-name, AppState.jam-join-address, AppState.jam-join-code); }
+                    }
+                }
+            }
+        }
+    }
+
+    if AppState.jam-role == "host": Section {
+        title: "Para invitar, comparte esto";
+        Field { label: "Dirección"; LineEdit { text: AppState.jam-address; read-only: true; } }
+        Field { label: "Código"; LineEdit { text: AppState.jam-code; read-only: true; } }
+    }
+
+    if AppState.jam-role != "off": Section {
+        title: AppState.jam-role == "host" ? "Invitados (" + AppState.jam-peers.length + ")" : "En el Jam";
+        if AppState.jam-peers.length == 0: Empty {
+            text: AppState.jam-role == "host" ? "Todavía no se une nadie." : "Conectando…";
+            horizontal-alignment: left;
+        }
+        for p in AppState.jam-peers: Text { text: "• " + p; color: #ddd; overflow: elide; }
+    }
+
+    if AppState.jam-role == "guest": Text { text: "A continuación"; color: Theme.accent; font-size: 15px; font-weight: 700; }
+    if AppState.jam-role == "guest": ListView {
+        vertical-stretch: 1;
+        for line in AppState.jam-queue: Text { height: 26px; text: line; color: #ddd; vertical-alignment: center; overflow: elide; }
+    }
+    if AppState.jam-role == "host": Rectangle { vertical-stretch: 1; }
 }
 
 // Barra de progreso propia (el Slider estandar pierde el enlace al arrastrar).
@@ -727,6 +824,8 @@ export component AppWindow inherits Window {
     min-height: 480px;
     background: #0f0f0f;
     default-font-size: 14px;
+    // Cambiarlo obliga a redibujar la ventana entera (ver desktop::watch_repaint).
+    in-out property <bool> repaint-flip;
 
     VerticalLayout {
         HorizontalLayout {
@@ -751,6 +850,12 @@ export component AppWindow inherits Window {
                     NavItem { glyph: "♥"; text: "Biblioteca"; active: AppState.page == "library"; clicked => { AppState.navigate("library"); } }
                     NavItem { glyph: "≡"; text: "Cola"; active: AppState.page == "queue"; clicked => { AppState.navigate("queue"); } }
                     NavItem { glyph: "♪"; text: "Letra"; active: AppState.page == "lyrics"; clicked => { AppState.navigate("lyrics"); } }
+                    NavItem {
+                        glyph: "◉";
+                        text: AppState.jam-role == "off" ? "Jam" : "Jam (en curso)";
+                        active: AppState.page == "jam";
+                        clicked => { AppState.navigate("jam"); }
+                    }
                     NavItem { glyph: "⚙"; text: "Ajustes"; active: AppState.page == "settings"; clicked => { AppState.navigate("settings"); } }
                 }
             }
@@ -768,6 +873,7 @@ export component AppWindow inherits Window {
                     if AppState.page == "queue": QueuePage { vertical-stretch: 1; }
                     if AppState.page == "lyrics": LyricsPage { vertical-stretch: 1; }
                     if AppState.page == "settings": SettingsPage { vertical-stretch: 1; }
+                    if AppState.page == "jam": JamPage { vertical-stretch: 1; }
                     if AppState.loading || AppState.status != "": Text {
                         text: AppState.loading ? "Cargando…" : AppState.status;
                         color: AppState.loading ? #aaa : #ffb74d;
@@ -778,6 +884,16 @@ export component AppWindow inherits Window {
             }
         }
         PlayerBar { }
+    }
+
+    // Capa invisible sobre toda la ventana: al cambiar su color, el renderer por software
+    // marca toda la ventana como sucia y la repinta completa (no solo las partes que cambiaron).
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: root.repaint-flip ? #00000001 : #00000000;
     }
 }
 

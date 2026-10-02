@@ -40,4 +40,5 @@ Ctrl+Shift+Space     Play / Pause
 Ctrl+Shift+Arrows    Next / Previous
 Ctrl+Shift+Y         Show / hide the window
 Keyboard media keys also work.
-Closing the window sends it to the tray; "Salir" in the tray menu quits.
+Closing the window (X) quits the app. To hide it without quitting, use Ctrl+Shift+Y
+or "Mostrar / Ocultar" in the tray menu.

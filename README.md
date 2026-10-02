@@ -26,10 +26,11 @@ Grab `YoutubeInRustWeb-Setup.exe` from the [latest release](https://github.com/B
 - **YouTube Music catalog** (home, search, artists, albums, playlists, radio, lyrics, library):
   [rustypipe](https://codeberg.org/ThetaDev/rustypipe) talking to YouTube Music's internal API.
 - **YouTube audio**: the stream URL is resolved by [yt-dlp](https://github.com/yt-dlp/yt-dlp)
-  (rustypipe can no longer decipher YouTube's current player). yt-dlp runs for ~4 s per song and exits.
+  (rustypipe can no longer decipher YouTube's current player). yt-dlp runs for ~2 s per song and exits
+  (the unpacked `yt-dlp_win.zip` build is used: the single-file .exe re-extracts itself on every run, +2.5 s).
   Downloading (AAC/M4A into memory), decoding (symphonia) and playback (rodio) are pure Rust.
   The next song is preloaded while the current one plays.
-- **Self-contained**: on first launch the app downloads yt-dlp into `%APPDATA%\YoutubeInRustWeb\bin`
+- **Self-contained**: on first launch the app downloads yt-dlp into `%APPDATA%\YoutubeInRustWeb\bin\yt-dlp`
   and updates it every 3 days. yt-dlp needs a JavaScript runtime: Node.js is used if installed,
   otherwise deno is downloaded into the same folder.
 - **Spotify** (Premium required): session and playback via
@@ -54,6 +55,7 @@ Grab `YoutubeInRustWeb-Setup.exe` from the [latest release](https://github.com/B
 - Remembers the queue and position on exit (never autoplays on launch).
 - No ads: the web page is never loaded, only the audio.
 - Single instance: launching it again brings the running window to the front.
+- **Jam**: listen together in sync with up to 8 people (see below).
 
 > The user interface is currently in Spanish.
 
@@ -84,12 +86,42 @@ and honours `Retry-After`, but if you still get 429 errors, use your own Client 
 
 Playback itself always goes through librespot and is not affected by this limit.
 
+### Jam (listen together)
+
+YouTube Music has no Jam, and the YouTube Data API v3 isn't built for real-time sync (and its
+quotas are tight), so the app orchestrates the session itself. YouTube is never asked to sync anything:
+
+- The **host** already downloads each song completely into memory, so it sends those same bytes
+  to the guests over TCP. YouTube sees one download per song no matter how many people join.
+  Only audio is shared, never video.
+- The host tells the guests which position to play at which instant *of the host's clock*. Each
+  guest estimates the host's clock the way NTP does (ping/pong, keeping the lowest-delay sample) and
+  seeks when it drifts more than 120 ms.
+- Guests can add songs, which go into the host's queue after earlier guest requests. They can also
+  play/pause, skip and seek; those requests are sent to the host.
+- Only YouTube Music audio is shared. When the host plays a Spotify song, guests see what it is but
+  can't hear it.
+- While a Jam is running, "skip leading silence" is turned off, because it would shift the position.
+
+How to use it: open **Jam** in the sidebar. The host clicks *Crear Jam* and shares the address
+(`IP:port`, default port `26541`) and the 6-character code. Guests type both in and click *Unirse*.
+It works on the same network or over a VPN such as Tailscale or ZeroTier. To invite people over the
+internet, open the port on the host's router. Windows may ask for a firewall permission the first time.
+
+Transport is plain TCP with a small length-prefixed framing (`src/jam/protocol.rs`): both ends are
+this app, so WebSocket adds nothing. WebRTC (NAT traversal) would cost many dependencies and memory.
+The protocol doesn't depend on the transport, so a WebRTC data channel can be added later.
+Audio chunks are written straight from the host's buffer and read straight into the guest's buffer,
+with no intermediate copies. Up to 8 guests.
+
 ## Project layout
 
 ```
 ui/app.slint              user interface
 src/main.rs               window, callbacks, single instance
 src/backend.rs            queue, playback, radio, search, lyrics, accounts
+src/backend/jam_link.rs   Jam <-> player glue (host broadcasts, guest drift correction)
+src/jam/                  Jam: protocol, clock sync (NTP-style), host, guest
 src/audio.rs              audio engine + equalizer + silence skipping + Spotify stream buffer
 src/stream.rs             yt-dlp (auto-download/update) + chunked download
 src/spotify.rs            Spotify: session/playback (librespot) + Web API
