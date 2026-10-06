@@ -154,7 +154,7 @@ cargo build --release
 & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer\YoutubeInRustWeb.iss
 ```
 
-Produces `installer\Output\YoutubeInRustWeb-Setup.exe` (~8 MB).
+Produces `installer\Output\YoutubeInRustWeb-Setup.exe` (~9 MB).
 
 ### Testing without touching your real settings
 
