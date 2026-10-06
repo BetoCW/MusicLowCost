@@ -117,7 +117,7 @@ impl Host {
         micros_since(self.inner.epoch)
     }
 
-    /// Nueva cancion. `data` = None si no se puede repartir (Spotify).
+    /// Nueva cancion. `data` = None si no se puede repartir.
     pub fn set_track(&self, track: &Track, data: Option<Arc<[u8]>>) {
         let tag = self.inner.tag.get().wrapping_add(1);
         self.inner.tag.set(tag);

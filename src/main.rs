@@ -14,7 +14,6 @@ mod logger;
 #[cfg(windows)]
 mod login;
 mod model;
-mod spotify;
 mod stream;
 mod ui;
 mod util;
@@ -207,7 +206,7 @@ fn wire_callbacks(ui: &AppWindow, tx: &tokio::sync::mpsc::UnboundedSender<Cmd>) 
     let weak = ui.as_weak();
     s.on_save_settings(move || {
         if let Some(u) = weak.upgrade() {
-            send!(t, Cmd::SaveSettings(Box::new(backend::read_cfg_from_ui(&u))));
+            send!(t, Cmd::SaveSettings(backend::read_cfg_from_ui(&u)));
         }
     });
     let t = tx.clone();
@@ -216,12 +215,6 @@ fn wire_callbacks(ui: &AppWindow, tx: &tokio::sync::mpsc::UnboundedSender<Cmd>) 
     s.on_logout(move || send!(t, Cmd::Logout));
     let t = tx.clone();
     s.on_lastfm_connect(move || send!(t, Cmd::LastfmConnect));
-    let t = tx.clone();
-    s.on_set_source(move |src| send!(t, Cmd::SetSource(src.to_string())));
-    let t = tx.clone();
-    s.on_sp_login(move || send!(t, Cmd::SpotifyLogin));
-    let t = tx.clone();
-    s.on_sp_logout(move || send!(t, Cmd::SpotifyLogout));
     let t = tx.clone();
     s.on_jam_host(move |name, port| send!(t, Cmd::JamHost(name.to_string(), port.clamp(1024, 65535) as u16)));
     let t = tx.clone();

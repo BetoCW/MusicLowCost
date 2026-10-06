@@ -33,7 +33,7 @@ pub enum Msg {
     /// `rx`/`tx`: reloj del anfitrion al recibir el Ping y al mandar el Pong.
     Pong { t0: i64, rx: i64, tx: i64 },
     /// Empieza una cancion; despues llegan `size` bytes de audio con el mismo tag.
-    /// `size == 0`: no se puede compartir (por ejemplo, Spotify).
+    /// `size == 0`: no se puede compartir.
     Track { tag: u32, track: Track, size: u64 },
     State { s: PlayState },
     Queue { tracks: Vec<Track> },
@@ -130,10 +130,10 @@ pub fn is_youtube_id(id: &str) -> bool {
 }
 
 /// Limpia una cancion que llega del otro lado: la portada solo puede ser de los
-/// servidores de imagenes de YouTube/Spotify (si no, la app descargaria cualquier URL)
+/// servidores de imagenes de YouTube (si no, la app descargaria cualquier URL)
 /// y el id de artista solo caracteres normales.
 pub fn sanitize(t: &mut Track) {
-    const HOSTS: [&str; 4] = ["googleusercontent.com", "ytimg.com", "ggpht.com", "scdn.co"];
+    const HOSTS: [&str; 3] = ["googleusercontent.com", "ytimg.com", "ggpht.com"];
     let thumb_ok = t.thumb.as_deref().is_some_and(|u| {
         let host = u.strip_prefix("https://").and_then(|r| r.split(['/', '?', '#']).next()).unwrap_or("");
         HOSTS.iter().any(|d| host == *d || host.strip_suffix(d).is_some_and(|p| p.ends_with('.')))

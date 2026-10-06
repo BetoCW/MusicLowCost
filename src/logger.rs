@@ -9,10 +9,7 @@ struct FileLogger(Mutex<Option<File>>);
 
 impl log::Log for FileLogger {
     fn enabled(&self, m: &log::Metadata) -> bool {
-        let t = m.target();
-        (t.starts_with(env!("CARGO_CRATE_NAME")) && m.level() <= log::Level::Info)
-            // De librespot solo avisos y errores (sirve para diagnosticar Spotify).
-            || (t.starts_with("librespot") && m.level() <= log::Level::Warn)
+        m.target().starts_with(env!("CARGO_CRATE_NAME")) && m.level() <= log::Level::Info
     }
 
     fn log(&self, r: &log::Record) {

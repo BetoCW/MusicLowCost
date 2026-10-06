@@ -1,6 +1,6 @@
 # MusicLowCost (YoutubeInRustWeb)
 
-A **native YouTube Music + Spotify desktop player written in Rust**, inspired by
+A **native YouTube Music desktop player written in Rust**, inspired by
 [Pear Desktop](https://github.com/pear-devs/pear-desktop). The goal: the same experience while
 using a fraction of the memory.
 
@@ -33,18 +33,10 @@ Grab `YoutubeInRustWeb-Setup.exe` from the [latest release](https://github.com/B
 - **Self-contained**: on first launch the app downloads yt-dlp into `%APPDATA%\YoutubeInRustWeb\bin\yt-dlp`
   and updates it every 3 days. yt-dlp needs a JavaScript runtime: Node.js is used if installed,
   otherwise deno is downloaded into the same folder.
-- **Spotify** (Premium required): session and playback via
-  [librespot](https://github.com/librespot-org/librespot); search and library via the Spotify Web API.
-  librespot's decoded audio is fed into the same engine (`StreamBuf` in `src/audio.rs`), so volume,
-  EQ and media controls behave identically for both sources.
-
 ## Features
 
-- **YouTube / Spotify switch** in the sidebar: home, search, library and queue follow the active source,
-  and the accent color changes (red for YouTube Music, green for Spotify). Each source keeps its own
-  queue; the other one is parked and restored when you come back.
-- Home (country charts / recently played), search (songs / albums, artists, playlists), artist,
-  album and playlist pages, queue with automatic radio (YouTube Music), shuffle and repeat.
+- Home (country charts), search (songs / albums, artists, playlists), artist,
+  album and playlist pages, queue with automatic radio, shuffle and repeat.
 - Synced lyrics (LRCLIB) or YouTube Music's official lyrics.
 - Windows media overlay and hardware media keys, tray icon, global hotkeys
   (`Ctrl+Shift+Space`, `Ctrl+Shift+←/→`, `Ctrl+Shift+Y`).
@@ -64,27 +56,13 @@ Grab `YoutubeInRustWeb-Setup.exe` from the [latest release](https://github.com/B
 - **YouTube Music**: Settings → *Iniciar sesión con Google* opens a Google window (a separate
   WebView2 process that closes by itself once you are signed in; its data is deleted afterwards).
   Without an account everything works except the library.
-- **Spotify**: Settings → *Iniciar sesión con Spotify* opens Spotify's official page in your browser
-  (OAuth). The session is stored in `%APPDATA%\YoutubeInRustWeb\spotify`.
-  There is no automatic radio for Spotify (Spotify no longer offers it to third-party apps).
 
-> **Spotify playback requires a Premium account.** Spotify only delivers audio to third-party
-> clients for Premium users. With a Free account you can still sign in, search and browse your
-> playlists, but trying to play shows a clear notice instead of playing.
+### Settings
 
-#### Spotify "HTTP 429 Too Many Requests"
-
-By default the Web API is called with the same Client ID used by librespot and other open-source
-clients, so its rate limit is shared with everyone using them. The app caches responses for 10 minutes
-and honours `Retry-After`, but if you still get 429 errors, use your own Client ID:
-
-1. Go to <https://developer.spotify.com/dashboard> → **Create app**.
-2. Redirect URI: `http://127.0.0.1:8898/login` — API: **Web API**.
-3. In **User Management**, add the email of every Spotify account that will use it (development
-   mode allows up to 25 users).
-4. Copy the **Client ID** into Settings → Spotify → *Client ID propio*, click *Guardar* and sign in again.
-
-Playback itself always goes through librespot and is not affected by this limit.
+The Settings page only shows simple options and saves each change immediately. Advanced options
+(equalizer, exponential volume, skip leading silence, country for the charts, global hotkeys,
+ListenBrainz, local HTTP API and its port, Jam port) still work but are only edited in
+`%APPDATA%\YoutubeInRustWeb\config.json` (close the app first).
 
 ### Jam (listen together)
 
@@ -99,8 +77,6 @@ quotas are tight), so the app orchestrates the session itself. YouTube is never 
   seeks when it drifts more than 120 ms.
 - Guests can add songs, which go into the host's queue after earlier guest requests. They can also
   play/pause, skip and seek; those requests are sent to the host.
-- Only YouTube Music audio is shared. When the host plays a Spotify song, guests see what it is but
-  can't hear it.
 - While a Jam is running, "skip leading silence" is turned off, because it would shift the position.
 
 How to use it: open **Jam** in the sidebar. The host clicks *Crear Jam* and shares the address
@@ -122,15 +98,13 @@ src/main.rs               window, callbacks, single instance
 src/backend.rs            queue, playback, radio, search, lyrics, accounts
 src/backend/jam_link.rs   Jam <-> player glue (host broadcasts, guest drift correction)
 src/jam/                  Jam: protocol, clock sync (NTP-style), host, guest
-src/audio.rs              audio engine + equalizer + silence skipping + Spotify stream buffer
+src/audio.rs              audio engine + equalizer + silence skipping
 src/stream.rs             yt-dlp (auto-download/update) + chunked download
-src/spotify.rs            Spotify: session/playback (librespot) + Web API
 src/images.rs             small cover art with a bounded cache
 src/desktop.rs            tray, global hotkeys, media overlay (SMTC)
 src/login.rs              Google sign-in window (`--login` process)
 src/integrations/         discord, scrobbler, lyrics (LRCLIB), sponsorblock, local API
 installer/                Inno Setup script
-vendor/librespot-core/    librespot-core 0.8.0 with one change: a Free account no longer calls exit(1)
 version-webview/          previous version (Tauri + WebView2, ~290 MB)
 ```
 
@@ -172,11 +146,11 @@ the `.ico` is embedded in the `.exe` (`build.rs`). Previous icons are in `icons/
 
 - [Pear Desktop](https://github.com/pear-devs/pear-desktop) (MIT) — the original app this is based on.
 - Performance scripts `cpu-tamer` and `rm3` by CY Fung (MIT), used by the WebView version.
-- [rustypipe](https://codeberg.org/ThetaDev/rustypipe), [librespot](https://github.com/librespot-org/librespot),
+- [rustypipe](https://codeberg.org/ThetaDev/rustypipe),
   [yt-dlp](https://github.com/yt-dlp/yt-dlp), [Slint](https://slint.dev), [rodio](https://github.com/RustAudio/rodio),
   [LRCLIB](https://lrclib.net), [SponsorBlock](https://sponsor.ajay.app).
 
-This is an unofficial client, not affiliated with YouTube, Google or Spotify.
+This is an unofficial client, not affiliated with YouTube or Google.
 
 ## License
 

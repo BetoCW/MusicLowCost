@@ -77,7 +77,7 @@ impl Backend {
         }
     }
 
-    /// Nueva cancion en el anfitrion. `data` = None si no se puede repartir (Spotify).
+    /// Nueva cancion en el anfitrion. `data` = None si no se puede repartir.
     pub(super) fn jam_host_track(&self, track: &Track, data: Option<Arc<[u8]>>) {
         self.with_host(|h| h.set_track(track, data));
     }
@@ -197,7 +197,6 @@ impl Backend {
         }
         crate::config::save(&self.dir, &self.cfg());
         self.engine.stop();
-        self.spotify.stop();
         self.on_play_state();
         let id = jam::next_id();
         let guest = Guest::start(addr, code, name, self.tx.clone(), id);
@@ -361,7 +360,7 @@ impl Backend {
         self.start_track_ui(&track);
         if !shared {
             self.ui.state(|s| s.set_buffering(false));
-            self.jam_status("El anfitrión está escuchando algo de Spotify: eso no se comparte en el Jam.");
+            self.jam_status("Esta canción del anfitrión no se puede compartir en el Jam.");
         }
         spawn(load_lyrics(self.clone(), track, seq));
     }

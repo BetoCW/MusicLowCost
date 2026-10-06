@@ -37,130 +37,9 @@ impl Effects {
     }
 }
 
-/// Buffer entre el decodificador de Spotify (librespot, en su propio hilo) y nuestro
-/// motor de audio. librespot escribe muestras aqui; si el buffer esta lleno (por ejemplo
-/// en pausa) espera, asi decodifica solo a velocidad de reproduccion.
-pub struct StreamBuf {
-    q: Mutex<std::collections::VecDeque<f32>>,
-    cv: std::sync::Condvar,
-    /// Mientras sea true se descartan las muestras (cambio de cancion o seek).
-    flushing: AtomicBool,
-    pub ended: AtomicBool,
-    base_ms: std::sync::atomic::AtomicU64,
-    frames: std::sync::atomic::AtomicU64,
-}
-
-pub const STREAM_RATE: u32 = 44100;
-const STREAM_CH: usize = 2;
-/// ~2 s de audio estereo.
-const STREAM_MAX: usize = STREAM_RATE as usize * STREAM_CH * 2;
-
-impl StreamBuf {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            q: Mutex::new(std::collections::VecDeque::with_capacity(STREAM_MAX)),
-            cv: std::sync::Condvar::new(),
-            flushing: AtomicBool::new(true),
-            ended: AtomicBool::new(false),
-            base_ms: std::sync::atomic::AtomicU64::new(0),
-            frames: std::sync::atomic::AtomicU64::new(0),
-        })
-    }
-
-    /// Llamado desde el hilo de librespot.
-    pub fn push(&self, samples: &[f32]) {
-        let mut q = self.q.lock().unwrap();
-        loop {
-            if self.flushing.load(Ordering::Relaxed) {
-                return;
-            }
-            if q.len() < STREAM_MAX {
-                break;
-            }
-            q = self.cv.wait_timeout(q, Duration::from_millis(100)).unwrap().0;
-        }
-        q.extend(samples.iter().copied());
-    }
-
-    /// Vacia el buffer y descarta lo que llegue hasta `end_flush`.
-    pub fn begin_flush(&self, position_ms: u64) {
-        self.flushing.store(true, Ordering::Relaxed);
-        self.q.lock().unwrap().clear();
-        self.base_ms.store(position_ms, Ordering::Relaxed);
-        self.frames.store(0, Ordering::Relaxed);
-        self.ended.store(false, Ordering::Relaxed);
-        self.cv.notify_all();
-    }
-
-    pub fn end_flush(&self) {
-        self.flushing.store(false, Ordering::Relaxed);
-    }
-
-    pub fn position(&self) -> f64 {
-        self.base_ms.load(Ordering::Relaxed) as f64 / 1000.0
-            + self.frames.load(Ordering::Relaxed) as f64 / STREAM_RATE as f64
-    }
-}
-
-/// Lado de rodio del StreamBuf. Si faltan datos devuelve silencio (sin contar tiempo).
-struct StreamSource {
-    buf: Arc<StreamBuf>,
-    local: std::collections::VecDeque<f32>,
-    ch: usize,
-}
-
-impl Iterator for StreamSource {
-    type Item = f32;
-
-    fn next(&mut self) -> Option<f32> {
-        if self.local.is_empty() {
-            let mut q = self.buf.q.lock().unwrap();
-            let n = q.len().min(4096) / STREAM_CH * STREAM_CH;
-            self.local.extend(q.drain(..n));
-            drop(q);
-            self.buf.cv.notify_all();
-        }
-        match self.local.pop_front() {
-            Some(s) => {
-                self.ch += 1;
-                if self.ch == STREAM_CH {
-                    self.ch = 0;
-                    self.buf.frames.fetch_add(1, Ordering::Relaxed);
-                }
-                Some(s)
-            }
-            None if self.buf.ended.load(Ordering::Relaxed) && self.buf.q.lock().unwrap().is_empty() => None,
-            None => Some(0.0),
-        }
-    }
-}
-
-impl Source for StreamSource {
-    fn current_span_len(&self) -> Option<usize> {
-        None
-    }
-    fn channels(&self) -> ChannelCount {
-        NonZero::new(STREAM_CH as u16).unwrap()
-    }
-    fn sample_rate(&self) -> SampleRate {
-        NonZero::new(STREAM_RATE).unwrap()
-    }
-    fn total_duration(&self) -> Option<Duration> {
-        None
-    }
-    fn try_seek(&mut self, _pos: Duration) -> Result<(), rodio::source::SeekError> {
-        // El seek real lo hace librespot (ver spotify.rs); aqui solo se tira lo local.
-        self.local.clear();
-        self.ch = 0;
-        Ok(())
-    }
-}
-
 pub struct Engine {
     mixer: rodio::mixer::Mixer,
     player: Mutex<Option<Player>>,
-    /// Si la cancion actual viene de Spotify, su buffer (para la posicion).
-    stream: Mutex<Option<Arc<StreamBuf>>>,
     pub fx: Arc<Effects>,
     volume: Mutex<f32>,
 }
@@ -187,12 +66,11 @@ impl Engine {
             })
             .map_err(|e| e.to_string())?;
         let mixer = rx.recv().map_err(|e| e.to_string())??;
-        Ok(Arc::new(Self { mixer, player: Mutex::new(None), stream: Mutex::new(None), fx, volume: Mutex::new(0.8) }))
+        Ok(Arc::new(Self { mixer, player: Mutex::new(None), fx, volume: Mutex::new(0.8) }))
     }
 
     /// Reemplaza lo que suena por `data` (archivo M4A completo en memoria).
     pub fn load(&self, data: Arc<[u8]>, start_paused: bool) -> Result<(), String> {
-        *self.stream.lock().unwrap() = None;
         let len = data.len() as u64;
         let decoder = Decoder::builder()
             .with_data(Cursor::new(data))
@@ -212,21 +90,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Reproduce lo que librespot vaya dejando en `buf` (canciones de Spotify).
-    pub fn load_stream(&self, buf: Arc<StreamBuf>, start_paused: bool) {
-        let player = Player::connect_new(&self.mixer);
-        player.set_volume(*self.volume.lock().unwrap());
-        if start_paused {
-            player.pause();
-        }
-        let source = StreamSource { buf: buf.clone(), local: Default::default(), ch: 0 };
-        player.append(Fx::new(source, self.fx.clone()));
-        *self.stream.lock().unwrap() = Some(buf);
-        *self.player.lock().unwrap() = Some(player);
-    }
-
     pub fn stop(&self) {
-        *self.stream.lock().unwrap() = None;
         *self.player.lock().unwrap() = None;
     }
 
@@ -251,9 +115,6 @@ impl Engine {
         self.with(|p| p.empty()).unwrap_or(false)
     }
     pub fn position(&self) -> f64 {
-        if let Some(b) = self.stream.lock().unwrap().as_ref() {
-            return b.position();
-        }
         self.with(|p| p.get_pos().as_secs_f64()).unwrap_or(0.0)
     }
     pub fn seek(&self, secs: f64) {
@@ -503,38 +364,6 @@ mod tests {
         assert_eq!(volume_curve(100.0, true), 1.0);
         assert!((volume_curve(50.0, true) - 0.125).abs() < 1e-6);
         assert_eq!(volume_curve(50.0, false), 0.5);
-    }
-
-    #[test]
-    fn buffer_de_spotify_entrega_en_orden_y_cuenta_el_tiempo() {
-        let buf = StreamBuf::new();
-        buf.begin_flush(10_000); // la cancion empieza en el segundo 10
-        buf.end_flush();
-        let samples: Vec<f32> = (0..STREAM_RATE as usize * 2).map(|i| i as f32).collect(); // 1 s estereo
-        buf.push(&samples);
-        let mut src = StreamSource { buf: buf.clone(), local: Default::default(), ch: 0 };
-        let got: Vec<f32> = (&mut src).take(samples.len()).collect();
-        assert_eq!(got, samples);
-        assert!((buf.position() - 11.0).abs() < 1e-6);
-        // Sin datos y sin terminar: silencio que no avanza el tiempo.
-        assert_eq!(src.next(), Some(0.0));
-        assert!((buf.position() - 11.0).abs() < 1e-6);
-        // Al terminar la cancion, la fuente se acaba.
-        buf.ended.store(true, Ordering::Relaxed);
-        assert_eq!(src.next(), None);
-    }
-
-    #[test]
-    fn flush_descarta_audio_viejo() {
-        let buf = StreamBuf::new();
-        buf.end_flush();
-        buf.push(&[1.0, 1.0]);
-        buf.begin_flush(0);
-        buf.push(&[2.0, 2.0]); // llega durante el flush: se descarta
-        buf.end_flush();
-        buf.push(&[3.0, 3.0]);
-        let mut src = StreamSource { buf, local: Default::default(), ch: 0 };
-        assert_eq!(src.next(), Some(3.0));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 // Interfaz nativa de YoutubeInRustWeb (Slint, renderizado por software: ~6 MB).
-import { LineEdit, Switch, Button, ComboBox, Slider, ScrollView, ListView, SpinBox } from "std-widgets.slint";
+import { LineEdit, Switch, Button, ComboBox, ScrollView, ListView } from "std-widgets.slint";
 
 export struct TrackRow {
     id: string,
@@ -25,9 +25,6 @@ export global AppState {
     in property <bool> loading;
     in property <string> status;
     in property <bool> logged-in;
-    // Fuente activa: "yt" (YouTube Music) o "sp" (Spotify)
-    in-out property <string> source: "yt";
-    in property <bool> sp-logged;
 
     in property <[TrackRow]> home-tracks;
     in property <[CardRow]> home-cards;
@@ -99,16 +96,13 @@ export global AppState {
     callback login(string);
     callback logout();
     callback lastfm-connect();
-    callback set-source(string);
-    callback sp-login();
-    callback sp-logout();
     callback jam-host(string, int); // nombre, puerto
     callback jam-join(string, string, string); // nombre, direccion, codigo
     callback jam-leave();
 }
 
 export global Theme {
-    out property <color> accent: AppState.source == "sp" ? #1ed760 : #ff4e45;
+    out property <color> accent: #ff4e45;
 }
 
 export global Cfg {
@@ -116,39 +110,11 @@ export global Cfg {
     in-out property <bool> autoplay-radio;
     in-out property <bool> notifications;
     in-out property <int> quality; // 0 alta, 1 ahorro
-    in-out property <string> country;
-    in-out property <bool> exponential-volume;
-    in-out property <bool> skip-silence;
     in-out property <bool> sponsorblock;
-    in-out property <bool> synced-lyrics;
-    in-out property <bool> eq-enabled;
-    in-out property <float> eq0;
-    in-out property <float> eq1;
-    in-out property <float> eq2;
-    in-out property <float> eq3;
-    in-out property <float> eq4;
-    in-out property <float> eq5;
-    in-out property <float> eq6;
-    in-out property <float> eq7;
-    in-out property <float> eq8;
-    in-out property <float> eq9;
     in-out property <bool> discord;
-    in-out property <bool> discord-hide-paused;
     in-out property <bool> lastfm;
     in property <string> lastfm-status;
-    in-out property <bool> listenbrainz;
-    in-out property <string> listenbrainz-token;
-    in-out property <bool> api-server;
-    in-out property <int> api-port: 26538;
-    in-out property <bool> shortcuts;
-    in-out property <string> sc-play;
-    in-out property <string> sc-next;
-    in-out property <string> sc-prev;
-    in-out property <string> sc-show;
-    in-out property <int> browser; // 0 firefox, 1 edge, 2 chrome, 3 brave
     in property <string> account-status;
-    in property <string> sp-status;
-    in-out property <string> sp-client-id;
 }
 
 component IconButton inherits Rectangle {
@@ -342,8 +308,8 @@ component HomePage inherits VerticalLayout {
     HorizontalLayout {
         spacing: 8px;
         alignment: start;
-        Tab { text: AppState.source == "sp" ? "Escuchado recientemente" : "Top canciones"; active: root.tab == 0; clicked => { root.tab = 0; } }
-        Tab { text: AppState.source == "sp" ? "Tus listas y artistas" : "Nuevos álbumes y listas"; active: root.tab == 1; clicked => { root.tab = 1; } }
+        Tab { text: "Top canciones"; active: root.tab == 0; clicked => { root.tab = 0; } }
+        Tab { text: "Nuevos álbumes y listas"; active: root.tab == 1; clicked => { root.tab = 1; } }
     }
     if root.tab == 0: TrackList { rows: AppState.home-tracks; list: "home"; }
     if root.tab == 1: CardList { rows: AppState.home-cards; }
@@ -398,11 +364,11 @@ component DetailPage inherits VerticalLayout {
 
 component LibraryPage inherits VerticalLayout {
     property <int> tab: 0;
-    property <bool> logged: AppState.source == "sp" ? AppState.sp-logged : AppState.logged-in;
+    property <bool> logged: AppState.logged-in;
     spacing: 12px;
     PageTitle { text: "Biblioteca"; }
     if !root.logged: Empty {
-        text: AppState.source == "sp" ? "Inicia sesión en Ajustes → Spotify para ver tus canciones y listas." : "Inicia sesión en Ajustes → Cuenta para ver tus Me gusta y tus listas.";
+        text: "Inicia sesión en Ajustes → Cuenta para ver tus Me gusta y tus listas.";
         horizontal-alignment: left;
     }
     if root.logged: HorizontalLayout {
@@ -470,77 +436,41 @@ component Field inherits HorizontalLayout {
     @children
 }
 
-component EqBand inherits VerticalLayout {
-    in property <string> label;
-    in-out property <float> value;
-    spacing: 2px;
-    alignment: center;
-    Slider {
-        orientation: vertical;
-        minimum: -12;
-        maximum: 12;
-        height: 120px;
-        value <=> root.value;
-    }
-    Text { text: root.label; color: #aaa; font-size: 11px; horizontal-alignment: center; }
-    Text { text: round(root.value) + " dB"; color: #777; font-size: 10px; horizontal-alignment: center; }
+// Interruptor que guarda en cuanto se cambia (sin boton "Guardar").
+component Option inherits Switch {
+    toggled => { AppState.save-settings(); }
 }
 
+// Solo lo que entiende cualquiera. Lo avanzado (ecualizador, atajos, API local,
+// puertos...) sigue funcionando desde config.json, pero no se muestra.
 component SettingsPage inherits VerticalLayout {
     spacing: 12px;
-    HorizontalLayout {
-        PageTitle { text: "Ajustes"; }
-        Rectangle { }
-        Button { text: "Guardar"; primary: true; clicked => { AppState.save-settings(); } }
-    }
+    PageTitle { text: "Ajustes"; }
     ScrollView {
         VerticalLayout {
             padding-right: 16px;
+            alignment: start;
             Section {
-                title: "General";
-                Switch { text: "Recordar la cola al abrir (sin reproducir sola)"; checked <=> Cfg.restore-session; }
-                Switch { text: "Al terminar la cola, seguir con canciones parecidas (radio)"; checked <=> Cfg.autoplay-radio; }
-                Switch { text: "Notificación al cambiar de canción"; checked <=> Cfg.notifications; }
+                title: "Reproducción";
+                Option { text: "Recordar lo que estaba escuchando al abrir la app"; checked <=> Cfg.restore-session; }
+                Option { text: "Al terminar, seguir con canciones parecidas"; checked <=> Cfg.autoplay-radio; }
+                Option { text: "Saltar las partes sin música de los videoclips"; checked <=> Cfg.sponsorblock; }
+                Option { text: "Avisarme cuando cambie la canción"; checked <=> Cfg.notifications; }
                 Field {
-                    label: "Calidad de audio";
-                    ComboBox { model: ["Alta (AAC 128 kbps)", "Ahorro de datos (AAC 48 kbps)"]; current-index <=> Cfg.quality; }
-                }
-                Field {
-                    label: "País para las listas (ej. MX, ES, US)";
-                    LineEdit { text <=> Cfg.country; }
+                    label: "Calidad del sonido";
+                    ComboBox {
+                        width: 200px;
+                        model: ["Alta", "Ahorrar datos"];
+                        current-index <=> Cfg.quality;
+                        selected => { AppState.save-settings(); }
+                    }
                 }
             }
             Section {
-                title: "Spotify (requiere Premium)";
-                Text { text: Cfg.sp-status; color: #aaa; wrap: word-wrap; }
-                Text {
-                    text: "Se abre la página oficial de Spotify en tu navegador; al aceptar, vuelve aquí.";
-                    color: #777;
-                    font-size: 12px;
-                    wrap: word-wrap;
-                }
-                HorizontalLayout {
-                    spacing: 10px;
-                    alignment: start;
-                    Button { text: "Iniciar sesión con Spotify"; clicked => { AppState.sp-login(); } }
-                    if AppState.sp-logged: Button { text: "Cerrar sesión"; clicked => { AppState.sp-logout(); } }
-                }
-                Field {
-                    label: "Client ID propio (opcional)";
-                    LineEdit { placeholder-text: "Vacío = el compartido"; text <=> Cfg.sp-client-id; }
-                }
-                Text {
-                    text: "Si aparece «HTTP 429», Spotify está limitando el Client ID compartido. Crea el tuyo gratis en developer.spotify.com/dashboard → Create app (Redirect URI: http://127.0.0.1:8898/login, API: Web API) y en «User Management» agrega el correo de cada cuenta que la use. Pega el Client ID aquí, pulsa Guardar y vuelve a iniciar sesión.";
-                    color: #777;
-                    font-size: 12px;
-                    wrap: word-wrap;
-                }
-            }
-            Section {
-                title: "Cuenta de YouTube Music (opcional)";
+                title: "Tu cuenta de YouTube (opcional)";
                 Text { text: Cfg.account-status; color: #aaa; wrap: word-wrap; }
                 Text {
-                    text: "Se abre una ventana de Google; entra con tu cuenta y se cierra sola al llegar a YouTube Music.";
+                    text: "Sirve para ver tus Me gusta y tus listas en «Biblioteca».";
                     color: #777;
                     font-size: 12px;
                     wrap: word-wrap;
@@ -553,56 +483,25 @@ component SettingsPage inherits VerticalLayout {
                 }
             }
             Section {
-                title: "Audio";
-                Switch { text: "Volumen exponencial (más control a volumen bajo)"; checked <=> Cfg.exponential-volume; }
-                Switch { text: "Saltar silencio al inicio de cada canción"; checked <=> Cfg.skip-silence; }
-                Switch { text: "SponsorBlock (saltar partes sin música de videoclips)"; checked <=> Cfg.sponsorblock; }
-                Switch { text: "Letras sincronizadas (LRCLIB), si no, la de YouTube Music"; checked <=> Cfg.synced-lyrics; }
-                Switch { text: "Ecualizador"; checked <=> Cfg.eq-enabled; }
-                HorizontalLayout {
-                    spacing: 4px;
-                    alignment: start;
-                    EqBand { label: "60"; value <=> Cfg.eq0; }
-                    EqBand { label: "170"; value <=> Cfg.eq1; }
-                    EqBand { label: "310"; value <=> Cfg.eq2; }
-                    EqBand { label: "600"; value <=> Cfg.eq3; }
-                    EqBand { label: "1k"; value <=> Cfg.eq4; }
-                    EqBand { label: "3k"; value <=> Cfg.eq5; }
-                    EqBand { label: "6k"; value <=> Cfg.eq6; }
-                    EqBand { label: "12k"; value <=> Cfg.eq7; }
-                    EqBand { label: "14k"; value <=> Cfg.eq8; }
-                    EqBand { label: "16k"; value <=> Cfg.eq9; }
-                }
-            }
-            Section {
-                title: "Integraciones";
-                Switch { text: "Discord Rich Presence"; checked <=> Cfg.discord; }
-                Switch { text: "Ocultar en Discord al pausar"; checked <=> Cfg.discord-hide-paused; }
-                Switch { text: "Scrobbling a Last.fm"; checked <=> Cfg.lastfm; }
-                HorizontalLayout {
+                title: "Extras";
+                Option { text: "Mostrar lo que escucho en Discord"; checked <=> Cfg.discord; }
+                Option { text: "Registrar lo que escucho en Last.fm"; checked <=> Cfg.lastfm; }
+                if Cfg.lastfm: HorizontalLayout {
                     spacing: 10px;
                     alignment: start;
                     Button { text: "Conectar Last.fm"; clicked => { AppState.lastfm-connect(); } }
                     Text { text: Cfg.lastfm-status; color: #aaa; vertical-alignment: center; }
                 }
-                Switch { text: "Scrobbling a ListenBrainz"; checked <=> Cfg.listenbrainz; }
-                Field { label: "Token de ListenBrainz"; LineEdit { text <=> Cfg.listenbrainz-token; } }
-                Switch { text: "API local HTTP en 127.0.0.1 (compatible con Pear)"; checked <=> Cfg.api-server; }
-                Field { label: "Puerto de la API"; SpinBox { minimum: 1024; maximum: 65535; value <=> Cfg.api-port; } }
-            }
-            Section {
-                title: "Atajos globales";
-                Switch { text: "Activar atajos globales"; checked <=> Cfg.shortcuts; }
-                Field { label: "Play / Pausa"; LineEdit { text <=> Cfg.sc-play; } }
-                Field { label: "Siguiente"; LineEdit { text <=> Cfg.sc-next; } }
-                Field { label: "Anterior"; LineEdit { text <=> Cfg.sc-prev; } }
-                Field { label: "Mostrar / ocultar ventana"; LineEdit { text <=> Cfg.sc-show; } }
-                Text { text: "Las teclas multimedia del teclado siempre funcionan."; color: #888; font-size: 12px; }
+                Text {
+                    text: "Atajos: Ctrl+Shift+Espacio (pausa), Ctrl+Shift+← / → (anterior / siguiente). Las teclas multimedia también funcionan.";
+                    color: #777;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
             }
         }
     }
 }
-
 component Hint inherits Text {
     color: #777;
     font-size: 12px;
@@ -620,7 +519,7 @@ component JamPage inherits VerticalLayout {
         }
     }
     Text {
-        text: "Escuchen lo mismo al mismo tiempo. El anfitrión descarga cada canción una sola vez y se la pasa a los demás; solo se comparte el audio de YouTube Music.";
+        text: "Escuchen lo mismo al mismo tiempo, cada quien en su computadora.";
         color: #aaa;
         wrap: word-wrap;
     }
@@ -631,15 +530,15 @@ component JamPage inherits VerticalLayout {
         vertical-stretch: 1;
         VerticalLayout {
             padding-right: 16px;
+            alignment: start;
             Section {
                 title: "Tu nombre";
                 LineEdit { placeholder-text: "Cómo te ven los demás"; text <=> AppState.jam-name; }
             }
             Section {
                 title: "Crear un Jam";
-                Field { label: "Puerto"; SpinBox { minimum: 1024; maximum: 65535; value <=> AppState.jam-port; } }
                 Hint {
-                    text: "Los invitados se conectan a tu PC en la misma red (o por una VPN como Tailscale o ZeroTier). Para invitar por internet, abre ese puerto en tu router. Windows puede pedirte permiso en el firewall: acéptalo para redes privadas.";
+                    text: "Funciona con personas conectadas a tu misma red (wifi de tu casa). Si Windows pregunta por el firewall, acepta.";
                 }
                 HorizontalLayout {
                     alignment: start;
@@ -648,7 +547,7 @@ component JamPage inherits VerticalLayout {
             }
             Section {
                 title: "Unirse a un Jam";
-                Field { label: "Dirección (IP:puerto)"; LineEdit { placeholder-text: "192.168.1.20:26541"; text <=> AppState.jam-join-address; } }
+                Field { label: "Dirección"; LineEdit { placeholder-text: "La que te pasó el anfitrión"; text <=> AppState.jam-join-address; } }
                 Field { label: "Código"; LineEdit { placeholder-text: "ABC123"; text <=> AppState.jam-join-code; } }
                 Hint { text: "Mientras estés en el Jam, lo que toques se agrega a la cola del anfitrión y los controles del reproductor le piden a él pausar, saltar o adelantar."; }
                 HorizontalLayout {
@@ -839,12 +738,6 @@ export component AppWindow inherits Window {
                     spacing: 4px;
                     alignment: start;
                     Text { text: "▶ YoutubeInRust"; color: #fff; font-size: 18px; font-weight: 700; height: 48px; vertical-alignment: center; }
-                    HorizontalLayout {
-                        spacing: 6px;
-                        padding-bottom: 8px;
-                        Tab { text: "YouTube"; active: AppState.source == "yt"; clicked => { AppState.set-source("yt"); } }
-                        Tab { text: "Spotify"; active: AppState.source == "sp"; clicked => { AppState.set-source("sp"); } }
-                    }
                     NavItem { glyph: "⌂"; text: "Inicio"; active: AppState.page == "home"; clicked => { AppState.navigate("home"); } }
                     NavItem { glyph: "◎"; text: "Buscar"; active: AppState.page == "search"; clicked => { AppState.navigate("search"); } }
                     NavItem { glyph: "♥"; text: "Biblioteca"; active: AppState.page == "library"; clicked => { AppState.navigate("library"); } }

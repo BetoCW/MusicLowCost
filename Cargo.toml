@@ -1,6 +1,6 @@
 [package]
 name = "youtube_in_rust_web"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [[bin]]
@@ -11,9 +11,6 @@ path = "src/main.rs"
 discord-rich-presence = "1.1.0"
 global-hotkey = "0.8.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
-librespot-core = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
-librespot-oauth = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
-librespot-playback = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
 log = "0.4.34"
 md-5 = "0.11.0"
 raw-window-handle = "0.6"
@@ -45,8 +42,3 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
-
-# librespot-core con un cambio: una cuenta Free ya no termina el proceso (exit(1)),
-# la app lo detecta y avisa. Ver vendor/librespot-core/src/session.rs.
-[patch.crates-io]
-librespot-core = { path = "vendor/librespot-core" }

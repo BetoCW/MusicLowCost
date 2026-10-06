@@ -7,7 +7,6 @@ use crate::images::Images;
 use crate::integrations::{api_server, discord, lyrics, scrobbler, sponsorblock};
 use crate::model::{self, Card, CardKind, Track, fmt_time};
 use crate::stream;
-use crate::spotify::{self, Spotify};
 use crate::ui::{CardListKind, ListKind, Ui};
 use crate::{AppState, Cfg, desktop};
 use rustypipe::client::RustyPipe;
@@ -47,14 +46,11 @@ pub enum Cmd {
     CycleRepeat,
     QueueRemove(usize),
     QueueClear,
-    SaveSettings(Box<Config>),
+    SaveSettings(UiSettings),
     Login(String),
     Logout,
     LastfmConnect,
     SaveSession,
-    SetSource(String),
-    SpotifyLogin,
-    SpotifyLogout,
     /// Crear un Jam: nombre, puerto.
     JamHost(String, u16),
     /// Unirse a un Jam: nombre, direccion, codigo.
@@ -70,14 +66,6 @@ struct Session {
     queue: Vec<Track>,
     index: Option<usize>,
     position: f64,
-    /// true si la cola que sonaba era de Spotify.
-    #[serde(default)]
-    active_sp: bool,
-    /// Cola "estacionada" de la otra fuente.
-    #[serde(default)]
-    other: Vec<Track>,
-    #[serde(default)]
-    other_index: Option<usize>,
 }
 
 struct State {
@@ -85,13 +73,9 @@ struct State {
     lists: HashMap<ListKind, Vec<Track>>,
     cards: HashMap<CardListKind, Vec<Card>>,
     detail_tracks_id: Option<(CardKind, String)>,
-    /// Cola que esta sonando (de la fuente `active_sp`).
+    /// Cola que esta sonando.
     queue: Vec<Track>,
     index: Option<usize>,
-    /// true si `queue` es de Spotify.
-    active_sp: bool,
-    /// Cola de la otra fuente, guardada mientras no se usa.
-    parked: (Vec<Track>, Option<usize>),
     /// Cambia cada vez que se reemplaza la cola (para descartar radios que llegan tarde).
     queue_gen: u64,
     shuffle: bool,
@@ -137,7 +121,6 @@ pub struct Backend {
     api_snapshot: api_server::Snapshot,
     api_enabled: Arc<AtomicBool>,
     api_started: RefCell<bool>,
-    spotify: Spotify,
     jam: RefCell<Jam>,
 }
 
@@ -164,7 +147,6 @@ pub fn run(
             .storage_dir(dir.clone())
             .build()
             .expect("rustypipe");
-        let spotify = Spotify::new(dir.clone(), http.clone());
         let b: B = Rc::new(Backend {
             rp,
             images: Images::new(http.clone()),
@@ -178,7 +160,6 @@ pub fn run(
             api_snapshot: Arc::new(Mutex::new(serde_json::json!({}))),
             api_enabled: Arc::new(AtomicBool::new(cfg.api_server)),
             api_started: RefCell::new(false),
-            spotify,
             jam: RefCell::new(Jam::Off),
             state: RefCell::new(State {
                 shuffle: false,
@@ -188,8 +169,6 @@ pub fn run(
                 detail_tracks_id: None,
                 queue: Vec::new(),
                 index: None,
-                active_sp: false,
-                parked: (Vec::new(), None),
                 queue_gen: 0,
                 current: None,
                 current_data: None,
@@ -219,17 +198,6 @@ pub fn run(
         b.restore_session();
         spawn(load_home(b.clone()));
         spawn(load_library(b.clone()));
-        if b.spotify.has_saved_login() {
-            b.ui.state(|s| s.set_sp_logged(true));
-            let b2 = b.clone();
-            spawn(async move {
-                let msg = match b2.spotify.load_user().await {
-                    Ok(u) => format!("Conectado como {u}"),
-                    Err(e) => e,
-                };
-                b2.ui.run(move |ui| ui.global::<Cfg>().set_sp_status(msg.into()));
-            });
-        }
         spawn(ticker(b.clone()));
         spawn(remove_login_webview());
         // Preparar yt-dlp en segundo plano (lo descarga la primera vez) y mantenerlo al dia.
@@ -262,43 +230,6 @@ impl Backend {
         self.state.borrow().cfg.clone()
     }
 
-    fn is_spotify_source(&self) -> bool {
-        self.state.borrow().cfg.source == "sp"
-    }
-
-    /// Si la fuente que se esta viendo no es la de la cola que suena, intercambia las colas:
-    /// la de la fuente vista pasa a ser la activa y la otra queda estacionada.
-    fn activate_view_queue(&self) {
-        let view_sp = self.is_spotify_source();
-        let mut st = self.state.borrow_mut();
-        if st.active_sp == view_sp {
-            return;
-        }
-        let parked = std::mem::take(&mut st.parked);
-        let active = (std::mem::take(&mut st.queue), st.index.take());
-        st.parked = active;
-        st.queue = parked.0;
-        st.index = parked.1;
-        st.active_sp = view_sp;
-        st.queue_gen += 1;
-        st.prefetch = None;
-        st.prefetching = None;
-    }
-
-    /// Aplica `f` a la cola de la fuente que se esta viendo (activa o estacionada).
-    /// El tercer argumento indica si es la cola que suena.
-    fn with_view_queue<R>(&self, f: impl FnOnce(&mut Vec<Track>, &mut Option<usize>, bool) -> R) -> R {
-        let view_sp = self.is_spotify_source();
-        let mut st = self.state.borrow_mut();
-        if st.active_sp == view_sp {
-            let st = &mut *st;
-            f(&mut st.queue, &mut st.index, true)
-        } else {
-            let (q, i) = &mut st.parked;
-            f(q, i, false)
-        }
-    }
-
     fn query(&self) -> rustypipe::client::RustyPipeQuery {
         let cfg_country = self.state.borrow().cfg.country.clone();
         let code = if cfg_country.trim().is_empty() {
@@ -319,7 +250,7 @@ impl Backend {
         }
         match cmd {
             Cmd::Navigate(page) => {
-                if page == "library" && (self.cfg().logged_in || self.is_spotify_source()) {
+                if page == "library" && self.cfg().logged_in {
                     spawn(load_library(self.clone()));
                 }
                 self.ui.state(move |s| {
@@ -334,7 +265,7 @@ impl Backend {
                 let t = self.state.borrow().lists.get(&kind).and_then(|l| l.get(i).cloned());
                 if let Some(t) = t {
                     let title = t.title.clone();
-                    self.with_view_queue(|q, _, _| q.push(t));
+                    self.state.borrow_mut().queue.push(t);
                     self.push_queue();
                     self.ui.status(format!("Agregada a la cola: {title}"));
                 }
@@ -405,9 +336,6 @@ impl Backend {
             Cmd::Seek(secs) => {
                 if self.engine.has_track() {
                     self.engine.seek(secs);
-                    if self.state.borrow().current.as_ref().is_some_and(|t| spotify::is_spotify(&t.id)) {
-                        self.spotify.seek(secs);
-                    }
                     self.state.borrow_mut().lyrics_idx = -2;
                     self.on_play_state();
                 } else {
@@ -447,96 +375,44 @@ impl Backend {
                 self.ui.state(move |s| s.set_repeat(r as i32));
             }
             Cmd::QueueRemove(i) => {
-                let changed = self.with_view_queue(|q, index, _| {
-                    if i >= q.len() {
-                        return false;
+                {
+                    let mut st = self.state.borrow_mut();
+                    if i >= st.queue.len() {
+                        return;
                     }
-                    q.remove(i);
-                    if let Some(cur) = *index {
+                    st.queue.remove(i);
+                    if let Some(cur) = st.index {
                         if i < cur {
-                            *index = Some(cur - 1);
+                            st.index = Some(cur - 1);
                         } else if i == cur {
-                            *index = if q.is_empty() { None } else { Some(cur.min(q.len() - 1)) };
+                            st.index = if st.queue.is_empty() { None } else { Some(cur.min(st.queue.len() - 1)) };
                         }
                     }
-                    true
-                });
-                if !changed {
-                    return;
                 }
                 self.push_queue();
                 self.clear_prefetch();
                 self.prefetch_next();
             }
             Cmd::QueueClear => {
-                self.with_view_queue(|q, index, _| {
+                {
+                    let mut st = self.state.borrow_mut();
                     // Se conserva la cancion actual.
-                    let cur = index.and_then(|i| q.get(i).cloned());
-                    *q = cur.into_iter().collect();
-                    *index = if q.is_empty() { None } else { Some(0) };
-                });
+                    let cur = st.index.and_then(|i| st.queue.get(i).cloned());
+                    st.queue = cur.into_iter().collect();
+                    st.index = if st.queue.is_empty() { None } else { Some(0) };
+                }
                 self.push_queue();
                 self.clear_prefetch();
             }
-            Cmd::SaveSettings(cfg) => {
-                {
-                    let mut st = self.state.borrow_mut();
-                    let mut cfg = *cfg;
-                    // Datos que la pantalla de ajustes no edita.
-                    cfg.volume = st.cfg.volume;
-                    cfg.lastfm.session_key = st.cfg.lastfm.session_key.clone();
-                    cfg.lastfm.user = st.cfg.lastfm.user.clone();
-                    cfg.lastfm.api_key = st.cfg.lastfm.api_key.clone();
-                    cfg.lastfm.secret = st.cfg.lastfm.secret.clone();
-                    cfg.logged_in = st.cfg.logged_in;
-                    cfg.source = st.cfg.source.clone();
-                    cfg.jam_name = st.cfg.jam_name.clone();
-                    cfg.jam_port = st.cfg.jam_port;
-                    cfg.jam_last_address = st.cfg.jam_last_address.clone();
-                    st.cfg = cfg;
-                }
+            Cmd::SaveSettings(s) => {
+                s.apply(&mut self.state.borrow_mut().cfg);
                 config::save(&self.dir, &self.cfg());
                 self.apply_settings(false);
-                self.ui.status("Ajustes guardados");
             }
             Cmd::Login(browser) => spawn(login(self.clone(), browser)),
             Cmd::Logout => spawn(logout(self.clone())),
             Cmd::LastfmConnect => spawn(lastfm_connect(self.clone())),
             Cmd::SaveSession => self.save_session(),
-            Cmd::SetSource(src) => {
-                let sp = src == "sp";
-                if self.is_spotify_source() == sp {
-                    return;
-                }
-                self.state.borrow_mut().cfg.source = if sp { "sp".into() } else { "yt".into() };
-                config::save(&self.dir, &self.cfg());
-                self.set_list(ListKind::Home, vec![]);
-                self.set_list(ListKind::Search, vec![]);
-                self.set_list(ListKind::Library, vec![]);
-                self.set_cards(CardListKind::Home, vec![]);
-                self.set_cards(CardListKind::Search, vec![]);
-                self.set_cards(CardListKind::Library, vec![]);
-                let s = src.clone();
-                self.ui.state(move |st| {
-                    st.set_source(s.into());
-                    st.set_status("".into());
-                });
-                self.push_queue();
-                spawn(load_home(self.clone()));
-                spawn(load_library(self.clone()));
-            }
-            Cmd::SpotifyLogin => spawn(spotify_login(self.clone())),
-            Cmd::SpotifyLogout => {
-                self.spotify.logout();
-                self.ui.state(|s| s.set_sp_logged(false));
-                self.ui.run(|ui| ui.global::<Cfg>().set_sp_status("Sin sesión de Spotify".into()));
-                if self.is_spotify_source() {
-                    self.set_list(ListKind::Home, vec![]);
-                    self.set_cards(CardListKind::Home, vec![]);
-                    self.set_list(ListKind::Library, vec![]);
-                    self.set_cards(CardListKind::Library, vec![]);
-                }
-            }
             Cmd::JamHost(name, port) => self.jam_start_host(name, port),
             Cmd::JamJoin(name, addr, code) => self.jam_join(name, addr, code),
             Cmd::JamLeave => self.jam_leave(None),
@@ -551,7 +427,6 @@ impl Backend {
         self.engine.fx.set_eq(cfg.eq_enabled, cfg.eq);
         self.sync_fx();
         self.engine.set_volume(volume_curve(cfg.volume, cfg.exponential_volume));
-        self.spotify.set_web_client_id(&cfg.spotify_client_id);
         if !cfg.discord {
             self.discord.send(discord::Msg::Clear);
         } else {
@@ -587,17 +462,11 @@ impl Backend {
     fn play_from_list(self: &Rc<Self>, list: &str, i: usize) {
         let Some(kind) = ListKind::parse(list) else { return };
         if kind == ListKind::Queue {
-            self.activate_view_queue();
             self.play_index(i, true);
             return;
         }
         let tracks = self.state.borrow().lists.get(&kind).cloned().unwrap_or_default();
         if kind == ListKind::Detail {
-            self.set_queue(tracks, i);
-            return;
-        }
-        if tracks.get(i).is_some_and(|t| spotify::is_spotify(&t.id)) {
-            // Spotify ya no ofrece "radio" a apps de terceros: se usa la lista como cola.
             self.set_queue(tracks, i);
             return;
         }
@@ -608,7 +477,6 @@ impl Backend {
     }
 
     fn set_queue(self: &Rc<Self>, queue: Vec<Track>, start: usize) {
-        self.activate_view_queue();
         {
             let mut st = self.state.borrow_mut();
             st.queue = queue;
@@ -621,7 +489,7 @@ impl Backend {
     }
 
     fn push_queue(&self) {
-        let queue = self.with_view_queue(|q, _, _| q.clone());
+        let queue = self.state.borrow().queue.clone();
         let current = self.state.borrow().current.as_ref().map(|t| t.id.clone());
         self.state.borrow_mut().lists.insert(ListKind::Queue, queue.clone());
         self.show_tracks(ListKind::Queue, queue, current);
@@ -648,7 +516,6 @@ impl Backend {
         };
         self.jam_host_hold();
         self.engine.stop();
-        self.spotify.stop();
         self.start_track_ui(&track);
         self.push_queue();
         spawn(load_and_play(self.clone(), track, seq, autoplay));
@@ -713,14 +580,8 @@ impl Backend {
     fn next(self: &Rc<Self>, user: bool) {
         let (idx, len, repeat, radio) = {
             let st = self.state.borrow();
-            let sp = st.current.as_ref().is_some_and(|t| spotify::is_spotify(&t.id));
-            (st.index, st.queue.len(), st.repeat, st.cfg.autoplay_radio && !sp)
+            (st.index, st.queue.len(), st.repeat, st.cfg.autoplay_radio)
         };
-        if !user && repeat == 2 && let Some(i) = idx.filter(|_| self.state.borrow().current_data.is_none()) {
-            // Repetir una en Spotify: se vuelve a pedir la misma cancion.
-            self.play_index(i, true);
-            return;
-        }
         if !user && repeat == 2 {
             // Repetir una: se reusa el audio en memoria.
             let data = self.state.borrow().current_data.clone();
@@ -800,7 +661,7 @@ impl Backend {
             let i = st.index.map(|i| i + 1).unwrap_or(0);
             st.queue.get(i).cloned()
         };
-        let Some(t) = next.filter(|t| !spotify::is_spotify(&t.id)) else { return };
+        let Some(t) = next else { return };
         {
             let mut st = self.state.borrow_mut();
             if st.prefetching.as_deref() == Some(t.id.as_str()) || st.prefetch.as_ref().map(|p| p.0 == t.id).unwrap_or(false) {
@@ -853,19 +714,6 @@ impl Backend {
         self.show_tracks(kind, tracks, current);
     }
 
-    /// Como set_list, pero solo si la fuente sigue siendo `src` (resultado que llega tarde).
-    fn set_list_if(&self, src: &str, kind: ListKind, tracks: Vec<Track>) {
-        if self.state.borrow().cfg.source == src {
-            self.set_list(kind, tracks);
-        }
-    }
-
-    fn set_cards_if(&self, src: &str, kind: CardListKind, cards: Vec<Card>) {
-        if self.state.borrow().cfg.source == src {
-            self.set_cards(kind, cards);
-        }
-    }
-
     fn set_cards(&self, kind: CardListKind, cards: Vec<Card>) {
         let covers: Vec<_> = cards.iter().map(|c| c.thumb.as_deref().and_then(|u| self.images.cached(u))).collect();
         self.ui.set_cards(kind, &cards, covers.clone());
@@ -900,9 +748,6 @@ impl Backend {
             } else {
                 st.restore_position.unwrap_or(0.0)
             },
-            active_sp: st.active_sp,
-            other: st.parked.0.iter().take(300).cloned().collect(),
-            other_index: st.parked.1,
         };
         if let Ok(s) = serde_json::to_vec(&session) {
             let _ = std::fs::write(self.dir.join("session.json"), s);
@@ -919,10 +764,9 @@ impl Backend {
         else {
             return;
         };
-        {
-            let mut st = self.state.borrow_mut();
-            st.active_sp = session.active_sp;
-            st.parked = (session.other, session.other_index);
+        // Colas guardadas por versiones con Spotify: ya no se pueden reproducir.
+        if session.queue.iter().any(|t| t.id.starts_with("spotify:")) {
+            return;
         }
         let Some(i) = session.index.filter(|i| *i < session.queue.len()) else {
             self.push_queue();
@@ -972,10 +816,6 @@ async fn play_failed(b: &B, track: &Track, seq: u64, e: String) {
         st.errors_in_row
     };
     b.ui.state(|s| s.set_buffering(false));
-    // Sin Premium no tiene sentido saltar a la siguiente cancion de Spotify.
-    if e.contains("Premium") {
-        return;
-    }
     if errors < 3 {
         tokio::time::sleep(Duration::from_secs(2)).await;
         if b.state.borrow().play_seq == seq {
@@ -985,58 +825,40 @@ async fn play_failed(b: &B, track: &Track, seq: u64, e: String) {
 }
 
 async fn load_and_play(b: B, track: Track, seq: u64, autoplay: bool) {
-    let is_spotify = spotify::is_spotify(&track.id);
     let restore = b.state.borrow_mut().restore_position.take().filter(|p| *p > 1.0);
-
-    if is_spotify {
-        // Spotify: librespot decodifica y deja el audio en el buffer compartido.
-        let start_ms = (restore.unwrap_or(0.0) * 1000.0) as u32;
-        let r = b.spotify.play(&track.id, start_ms).await;
-        if b.state.borrow().play_seq != seq {
-            return;
-        }
-        if let Err(e) = r {
-            return play_failed(&b, &track, seq, e).await;
-        }
-        b.engine.load_stream(b.spotify.buf.clone(), !autoplay);
-        b.state.borrow_mut().current_data = None;
-        // El audio de Spotify no se reparte: los invitados solo ven que cancion es.
-        b.jam_host_track(&track, None);
-    } else {
-        let pre = {
-            let mut st = b.state.borrow_mut();
-            match st.prefetch.take() {
-                Some((id, data)) if id == track.id => Some(data),
-                other => {
-                    st.prefetch = other;
-                    None
-                }
+    let pre = {
+        let mut st = b.state.borrow_mut();
+        match st.prefetch.take() {
+            Some((id, data)) if id == track.id => Some(data),
+            other => {
+                st.prefetch = other;
+                None
             }
-        };
-        let low = b.cfg().quality == 1;
-        let result = match pre {
-            Some(d) => Ok(d),
-            None => fetch_audio(&b, &track.id, low).await,
-        };
-        if b.state.borrow().play_seq != seq {
-            return; // el usuario ya eligio otra cancion
         }
-        let data = match result {
-            Ok(d) => d,
-            Err(e) => return play_failed(&b, &track, seq, e).await,
-        };
-        if let Err(e) = b.engine.load(data.clone(), !autoplay) {
-            b.ui.status(e);
-            return;
-        }
-        if let Some(pos) = restore {
-            b.engine.seek(pos);
-        }
-        b.jam_host_track(&track, Some(data.clone()));
-        b.state.borrow_mut().current_data = Some(data);
+    };
+    let low = b.cfg().quality == 1;
+    let result = match pre {
+        Some(d) => Ok(d),
+        None => fetch_audio(&b, &track.id, low).await,
+    };
+    if b.state.borrow().play_seq != seq {
+        return; // el usuario ya eligio otra cancion
     }
+    let data = match result {
+        Ok(d) => d,
+        Err(e) => return play_failed(&b, &track, seq, e).await,
+    };
+    if let Err(e) = b.engine.load(data.clone(), !autoplay) {
+        b.ui.status(e);
+        return;
+    }
+    if let Some(pos) = restore {
+        b.engine.seek(pos);
+    }
+    b.jam_host_track(&track, Some(data.clone()));
     {
         let mut st = b.state.borrow_mut();
+        st.current_data = Some(data);
         st.buffering = false;
         st.errors_in_row = 0;
         st.last_tick = Instant::now();
@@ -1058,7 +880,7 @@ async fn load_and_play(b: B, track: Track, seq: u64, autoplay: bool) {
     if cfg.lastfm.enabled || cfg.listenbrainz {
         spawn(scrobbler::now_playing(b.http.clone(), cfg.clone(), track.clone()));
     }
-    if cfg.sponsorblock && !is_spotify {
+    if cfg.sponsorblock {
         let b2 = b.clone();
         let id = track.id.clone();
         spawn(async move {
@@ -1070,12 +892,12 @@ async fn load_and_play(b: B, track: Track, seq: u64, autoplay: bool) {
     }
     spawn(load_lyrics(b.clone(), track.clone(), seq));
 
-    // Si la cola se acaba pronto, se agrega la radio de esta cancion (solo YouTube Music).
+    // Si la cola se acaba pronto, se agrega la radio de esta cancion.
     let (idx, len) = {
         let st = b.state.borrow();
         (st.index.unwrap_or(0), st.queue.len())
     };
-    if cfg.autoplay_radio && !is_spotify && idx + 2 >= len {
+    if cfg.autoplay_radio && idx + 2 >= len {
         spawn(extend_with_radio(b.clone(), track, false));
     } else {
         b.prefetch_next();
@@ -1092,8 +914,8 @@ async fn extend_with_radio(b: B, seed: Track, replace_rest: bool) {
     b.state.borrow_mut().radio_loading = false;
     {
         let st = b.state.borrow();
-        if st.queue_gen != queue_gen || st.active_sp {
-            return; // se cambio de cola o de fuente mientras llegaba la radio
+        if st.queue_gen != queue_gen {
+            return; // se cambio de cola mientras llegaba la radio
         }
     }
     match res {
@@ -1164,10 +986,6 @@ async fn load_lyrics(b: B, t: Track, seq: u64) {
 }
 
 async fn load_home(b: B) {
-    let src = b.cfg().source.clone();
-    if b.is_spotify_source() {
-        return spotify_list(b, true).await;
-    }
     b.ui.loading(true);
     let q = b.query();
     match q.music_charts(None).await {
@@ -1191,14 +1009,14 @@ async fn load_home(b: B) {
                     }
                 }
             }
-            b.set_list_if(&src, ListKind::Home, tracks);
+            b.set_list(ListKind::Home, tracks);
             let mut cards: Vec<Card> = Vec::new();
             if let Ok(albums) = q.music_new_albums().await {
                 cards.extend(albums.into_iter().take(40).map(model::from_album));
             }
             cards.extend(charts.playlists.into_iter().map(model::from_playlist));
             cards.extend(charts.artists.into_iter().take(20).map(model::from_artist));
-            b.set_cards_if(&src, CardListKind::Home, cards);
+            b.set_cards(CardListKind::Home, cards);
         }
         Err(e) => {
             log::warn!("inicio: {e}");
@@ -1209,23 +1027,10 @@ async fn load_home(b: B) {
 }
 
 async fn search(b: B, q: String) {
-    let src = b.cfg().source.clone();
     if q.trim().is_empty() {
         return;
     }
     b.ui.loading(true);
-    if b.is_spotify_source() {
-        match b.spotify.search(q.trim()).await {
-            Ok((tracks, cards)) => {
-                b.set_list_if(&src, ListKind::Search, tracks);
-                b.set_cards_if(&src, CardListKind::Search, cards);
-                b.ui.status("");
-            }
-            Err(e) => b.ui.status(format!("Error al buscar en Spotify: {e}")),
-        }
-        b.ui.loading(false);
-        return;
-    }
     let query = b.query();
     let q = q.trim();
     // Canciones con el filtro dedicado (trae ~20 y bien etiquetadas) y el resto
@@ -1250,8 +1055,8 @@ async fn search(b: B, q: String) {
                 Ok(t) if !t.items.items.is_empty() => t.items.items.into_iter().map(model::from_track).collect(),
                 _ => fallback_tracks,
             };
-            b.set_list_if(&src, ListKind::Search, tracks);
-            b.set_cards_if(&src, CardListKind::Search, cards);
+            b.set_list(ListKind::Search, tracks);
+            b.set_cards(CardListKind::Search, cards);
             b.ui.status("");
         }
         Err(e) => b.ui.status(format!("Error al buscar: {e}")),
@@ -1260,12 +1065,9 @@ async fn search(b: B, q: String) {
 }
 
 async fn open_card(b: B, kind: CardKind, id: String) {
-    let src = b.cfg().source.clone();
     b.ui.loading(true);
     let q = b.query();
-    let result: Result<(String, String, Option<String>, Vec<Track>, Vec<Card>), String> = if spotify::is_spotify(&id) {
-        b.spotify.open(kind, &id).await
-    } else { match kind {
+    let result: Result<(String, String, Option<String>, Vec<Track>, Vec<Card>), String> = match kind {
         CardKind::Album => q.music_album(&id).await.map_err(|e| e.to_string()).map(|a| {
             let cover = model::pick_thumb(&a.cover, 60);
             let artists = a.artists.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(", ");
@@ -1318,7 +1120,7 @@ async fn open_card(b: B, kind: CardKind, id: String) {
             cards.extend(a.similar_artists.into_iter().map(model::from_artist));
             (a.name, sub, cover, tracks, cards)
         }),
-    }};
+    };
     b.ui.loading(false);
     let (title, subtitle, cover, tracks, cards) = match result {
         Ok(r) => r,
@@ -1327,12 +1129,9 @@ async fn open_card(b: B, kind: CardKind, id: String) {
             return;
         }
     };
-    if b.cfg().source != src {
-        return;
-    }
     b.state.borrow_mut().detail_tracks_id = Some((kind, id));
-    b.set_list_if(&src, ListKind::Detail, tracks);
-    b.set_cards_if(&src, CardListKind::Detail, cards);
+    b.set_list(ListKind::Detail, tracks);
+    b.set_cards(CardListKind::Detail, cards);
     let k = kind.as_str();
     b.ui.state(move |s| {
         s.set_detail_kind(k.into());
@@ -1351,21 +1150,6 @@ async fn open_card(b: B, kind: CardKind, id: String) {
 }
 
 async fn load_library(b: B) {
-    let src = b.cfg().source.clone();
-    if b.is_spotify_source() {
-        // En Spotify la biblioteca son varias consultas: solo cuando se abre la pagina.
-        let on_library = {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            b.ui.state(move |s| {
-                let _ = tx.send(s.get_page() == "library");
-            });
-            rx.await.unwrap_or(false)
-        };
-        if !on_library {
-            return;
-        }
-        return spotify_list(b, false).await;
-    }
     if !b.cfg().logged_in {
         return;
     }
@@ -1373,7 +1157,7 @@ async fn load_library(b: B) {
     match q.music_liked_tracks().await {
         Ok(mut p) => {
             let _ = p.tracks.extend_limit(&q, 500).await;
-            b.set_list_if(&src, ListKind::Library, p.tracks.items.into_iter().map(model::from_track).collect());
+            b.set_list(ListKind::Library, p.tracks.items.into_iter().map(model::from_track).collect());
         }
         Err(e) => {
             log::warn!("biblioteca: {e}");
@@ -1388,7 +1172,7 @@ async fn load_library(b: B) {
     if let Ok(a) = q.music_saved_albums().await {
         cards.extend(a.items.into_iter().map(model::from_album));
     }
-    b.set_cards_if(&src, CardListKind::Library, cards);
+    b.set_cards(CardListKind::Library, cards);
     b.ui.state(|s| s.set_logged_in(true));
 }
 
@@ -1588,85 +1372,58 @@ pub fn push_cfg_to_ui(ui: &crate::AppWindow, cfg: &Config) {
     c.set_autoplay_radio(cfg.autoplay_radio);
     c.set_notifications(cfg.notifications);
     c.set_quality(cfg.quality as i32);
-    c.set_country(cfg.country.clone().into());
-    c.set_exponential_volume(cfg.exponential_volume);
-    c.set_skip_silence(cfg.skip_silence);
     c.set_sponsorblock(cfg.sponsorblock);
-    c.set_synced_lyrics(cfg.synced_lyrics);
-    c.set_eq_enabled(cfg.eq_enabled);
-    c.set_eq0(cfg.eq[0]);
-    c.set_eq1(cfg.eq[1]);
-    c.set_eq2(cfg.eq[2]);
-    c.set_eq3(cfg.eq[3]);
-    c.set_eq4(cfg.eq[4]);
-    c.set_eq5(cfg.eq[5]);
-    c.set_eq6(cfg.eq[6]);
-    c.set_eq7(cfg.eq[7]);
-    c.set_eq8(cfg.eq[8]);
-    c.set_eq9(cfg.eq[9]);
     c.set_discord(cfg.discord);
-    c.set_discord_hide_paused(cfg.discord_hide_paused);
     c.set_lastfm(cfg.lastfm.enabled);
     c.set_lastfm_status(
         cfg.lastfm.user.as_ref().map(|u| format!("Conectado como {u}")).unwrap_or_else(|| "Sin conectar".into()).into(),
     );
-    c.set_listenbrainz(cfg.listenbrainz);
-    c.set_listenbrainz_token(cfg.listenbrainz_token.clone().into());
-    c.set_api_server(cfg.api_server);
-    c.set_api_port(cfg.api_port as i32);
-    c.set_shortcuts(cfg.shortcuts);
-    c.set_sc_play(cfg.sc_play.clone().into());
-    c.set_sc_next(cfg.sc_next.clone().into());
-    c.set_sc_prev(cfg.sc_prev.clone().into());
-    c.set_sc_show(cfg.sc_show.clone().into());
-    c.set_sp_client_id(cfg.spotify_client_id.clone().into());
-    c.set_browser(cfg.browser as i32);
     c.set_account_status(if cfg.logged_in { "Sesión iniciada" } else { "Sin sesión (todo funciona igual, solo no ves tu biblioteca)" }.into());
     let s = ui.global::<AppState>();
     s.set_volume(cfg.volume);
-    s.set_source(if cfg.source == "sp" { "sp".into() } else { "yt".into() });
-    c.set_sp_status("Sin sesión de Spotify".into());
     s.set_logged_in(cfg.logged_in);
     s.set_jam_name(cfg.jam_name.clone().into());
     s.set_jam_port(cfg.jam_port as i32);
     s.set_jam_join_address(cfg.jam_last_address.clone().into());
 }
 
-/// Lee la pantalla de ajustes a un Config.
-pub fn read_cfg_from_ui(ui: &crate::AppWindow) -> Config {
+/// Lo que se puede cambiar en la pantalla de ajustes. Las opciones avanzadas
+/// (ecualizador, atajos, API local, puertos...) solo se editan en config.json.
+#[derive(Debug)]
+pub struct UiSettings {
+    restore_session: bool,
+    autoplay_radio: bool,
+    notifications: bool,
+    quality: u8,
+    sponsorblock: bool,
+    discord: bool,
+    lastfm: bool,
+}
+
+impl UiSettings {
+    fn apply(self, cfg: &mut Config) {
+        cfg.restore_session = self.restore_session;
+        cfg.autoplay_radio = self.autoplay_radio;
+        cfg.notifications = self.notifications;
+        cfg.quality = self.quality;
+        cfg.sponsorblock = self.sponsorblock;
+        cfg.discord = self.discord;
+        cfg.lastfm.enabled = self.lastfm;
+    }
+}
+
+/// Lee la pantalla de ajustes.
+pub fn read_cfg_from_ui(ui: &crate::AppWindow) -> UiSettings {
     let c = ui.global::<Cfg>();
-    let mut cfg = Config {
+    UiSettings {
         restore_session: c.get_restore_session(),
         autoplay_radio: c.get_autoplay_radio(),
         notifications: c.get_notifications(),
         quality: c.get_quality().clamp(0, 1) as u8,
-        country: c.get_country().to_string(),
-        exponential_volume: c.get_exponential_volume(),
-        skip_silence: c.get_skip_silence(),
         sponsorblock: c.get_sponsorblock(),
-        synced_lyrics: c.get_synced_lyrics(),
-        eq_enabled: c.get_eq_enabled(),
-        eq: [
-            c.get_eq0(), c.get_eq1(), c.get_eq2(), c.get_eq3(), c.get_eq4(),
-            c.get_eq5(), c.get_eq6(), c.get_eq7(), c.get_eq8(), c.get_eq9(),
-        ],
         discord: c.get_discord(),
-        discord_hide_paused: c.get_discord_hide_paused(),
-        listenbrainz: c.get_listenbrainz(),
-        listenbrainz_token: c.get_listenbrainz_token().to_string(),
-        api_server: c.get_api_server(),
-        api_port: c.get_api_port().clamp(1024, 65535) as u16,
-        shortcuts: c.get_shortcuts(),
-        sc_play: c.get_sc_play().to_string(),
-        sc_next: c.get_sc_next().to_string(),
-        sc_prev: c.get_sc_prev().to_string(),
-        sc_show: c.get_sc_show().to_string(),
-        spotify_client_id: c.get_sp_client_id().trim().to_string(),
-        browser: c.get_browser().clamp(0, 3) as u8,
-        ..Config::default()
-    };
-    cfg.lastfm.enabled = c.get_lastfm();
-    cfg
+        lastfm: c.get_lastfm(),
+    }
 }
 
 /// Borra los datos del WebView de inicio de sesion. WebView2 tarda unos segundos en
@@ -1682,43 +1439,3 @@ async fn remove_login_webview() {
     log::warn!("no se pudo borrar {}", dir.display());
 }
 
-/// Inicio o biblioteca de Spotify.
-async fn spotify_list(b: B, home: bool) {
-    let src = b.cfg().source.clone();
-    if !b.spotify.has_saved_login() {
-        if home {
-            b.ui.status("Inicia sesión con Spotify en Ajustes → Spotify (requiere Premium).");
-        }
-        return;
-    }
-    b.ui.loading(true);
-    let r = if home { b.spotify.home().await } else { b.spotify.library().await };
-    b.ui.loading(false);
-    match r {
-        Ok((tracks, cards)) => {
-            let (lk, ck) = if home { (ListKind::Home, CardListKind::Home) } else { (ListKind::Library, CardListKind::Library) };
-            b.set_list_if(&src, lk, tracks);
-            b.set_cards_if(&src, ck, cards);
-        }
-        Err(e) => b.ui.status(format!("Spotify: {e}")),
-    }
-}
-
-async fn spotify_login(b: B) {
-    let set = |b: &B, m: String| b.ui.run(move |ui| ui.global::<Cfg>().set_sp_status(m.into()));
-    set(&b, "Autoriza la app en la página de Spotify que se abrió en tu navegador…".into());
-    match b.spotify.login().await {
-        Ok(user) => {
-            set(&b, format!("Conectado como {user}"));
-            b.ui.state(|s| s.set_sp_logged(true));
-            if b.is_spotify_source() {
-                spawn(load_home(b.clone()));
-                spawn(load_library(b.clone()));
-            }
-        }
-        Err(e) => {
-            log::warn!("Spotify login: {e}");
-            set(&b, e);
-        }
-    }
-}

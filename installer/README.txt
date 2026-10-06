@@ -1,8 +1,8 @@
-YoutubeInRustWeb 0.3.0  (MusicLowCost)
+YoutubeInRustWeb 0.4.0  (MusicLowCost)
 ======================================
 
-Native YouTube Music + Spotify player written in Rust.
-Uses ~20-60 MB of RAM (the official Spotify / YouTube Music apps: 300-700 MB).
+Native YouTube Music player written in Rust.
+Uses ~20-60 MB of RAM (the official YouTube Music app / Pear: 300-700 MB).
 Source code: https://github.com/BetoCW/MusicLowCost
 
 FIRST RUN
@@ -11,17 +11,7 @@ FIRST RUN
    YouTube audio). If Node.js is not installed it also downloads "deno" (~45 MB).
    This only happens once; files go to %APPDATA%\YoutubeInRustWeb\bin.
 
-2. SPOTIFY (requires a PREMIUM account to play music; with a Free account you can
-   browse and search, but playback shows a notice instead):
-   - In the top-left corner choose "Spotify".
-   - Open Settings ("Ajustes") -> "Iniciar sesión con Spotify".
-   - Spotify's official page opens in your browser: accept and go back to the app.
-   - The session is remembered for next time.
-   - If you see "HTTP 429" (too many requests), Spotify is rate-limiting the shared
-     Client ID. Create your own (free) and paste it in Settings -> Spotify:
-     https://github.com/BetoCW/MusicLowCost#spotify-http-429-too-many-requests
-
-3. YOUTUBE MUSIC works without an account. To see your likes and playlists:
+2. YOUTUBE MUSIC works without an account. To see your likes and playlists:
    Settings ("Ajustes") -> "Iniciar sesión con Google".
 
 "WINDOWS PROTECTED YOUR PC"

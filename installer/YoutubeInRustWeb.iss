@@ -3,7 +3,7 @@
 ; Output:  installer\Output\YoutubeInRustWeb-Setup.exe
 
 #define AppName "YoutubeInRustWeb"
-#define AppVersion "0.3.0"
+#define AppVersion "0.4.0"
 #define AppExe "YoutubeInRustWeb.exe"
 
 [Setup]
@@ -12,7 +12,7 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher=BetoCW
 AppPublisherURL=https://github.com/BetoCW/MusicLowCost
-AppComments=Lightweight native YouTube Music + Spotify player (Rust)
+AppComments=Lightweight native YouTube Music player (Rust)
 ; Per-user install: no administrator rights needed.
 PrivilegesRequired=lowest
 DefaultDirName={localappdata}\Programs\{#AppName}

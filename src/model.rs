@@ -18,10 +18,7 @@ pub struct Track {
 
 impl Track {
     pub fn url(&self) -> String {
-        match self.id.strip_prefix("spotify:track:") {
-            Some(id) => format!("https://open.spotify.com/track/{id}"),
-            None => format!("https://music.youtube.com/watch?v={}", self.id),
-        }
+        format!("https://music.youtube.com/watch?v={}", self.id)
     }
 }
 

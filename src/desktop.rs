@@ -198,41 +198,56 @@ pub fn init(
 unsafe extern "system" {
     fn GetForegroundWindow() -> isize;
     fn IsIconic(hwnd: isize) -> i32;
+    fn IsZoomed(hwnd: isize) -> i32;
     fn IsWindowVisible(hwnd: isize) -> i32;
+    fn GetWindowRect(hwnd: isize, rect: *mut [i32; 4]) -> i32;
     fn GetSystemMetrics(index: i32) -> i32;
     fn RedrawWindow(hwnd: isize, rect: *const std::ffi::c_void, rgn: isize, flags: u32) -> i32;
 }
 
 /// El renderer por software solo repinta lo que cambio y reutiliza el resto del buffer.
-/// Un juego en pantalla completa (cambio de resolucion / modo exclusivo) borra ese buffer
-/// sin que la app se entere, y al volver con Alt+Tab la ventana queda con basura.
-/// Cada vez que cambia la ventana en primer plano o la resolucion, se repinta todo
-/// (tambien el marco de Windows) durante ~1 s, porque el juego tarda en soltar la pantalla.
+/// Si Windows descarta el contenido de la ventana (un juego en pantalla completa, otra app
+/// maximizada encima, cambio de monitores...) la app no se entera y queda con basura.
+/// Cuando cambia la ventana en primer plano o su posicion, la resolucion o el estado
+/// maximizado, se repinta todo (tambien el marco) durante ~1 s, porque el otro programa
+/// tarda en soltar la pantalla. Maximizada ademas se repinta cada ~2 s por si acaso:
+/// tapa toda la pantalla y es donde mas se notaba.
 #[cfg(windows)]
 pub fn watch_repaint(weak: slint::Weak<crate::AppWindow>, hwnd: Option<isize>) {
     let Some(hwnd) = hwnd else { return };
-    const SM_CXSCREEN: i32 = 0;
-    const SM_CYSCREEN: i32 = 1;
+    const SM_XVIRTUALSCREEN: i32 = 76;
+    const SM_YVIRTUALSCREEN: i32 = 77;
+    const SM_CXVIRTUALSCREEN: i32 = 78;
+    const SM_CYVIRTUALSCREEN: i32 = 79;
     const RDW_INVALIDATE: u32 = 0x0001;
     const RDW_ERASE: u32 = 0x0004;
     const RDW_FRAME: u32 = 0x0400;
-    let screen = || unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
-    let mut last_fg = unsafe { GetForegroundWindow() };
-    let mut last_screen = screen();
+    // Todo lo que, si cambia, puede haber dejado la ventana sin pintar.
+    let snapshot = move || unsafe {
+        let fg = GetForegroundWindow();
+        let mut fg_rect = [0; 4];
+        GetWindowRect(fg, &mut fg_rect);
+        let mut own_rect = [0; 4];
+        GetWindowRect(hwnd, &mut own_rect);
+        let screens = [SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN].map(|m| GetSystemMetrics(m));
+        (fg, fg_rect, own_rect, screens, IsZoomed(hwnd) != 0)
+    };
+    let mut last = snapshot();
     let mut pending = 0u8;
+    let mut ticks = 0u32;
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(250), move || {
-        let fg = unsafe { GetForegroundWindow() };
-        let scr = screen();
-        if fg != last_fg || scr != last_screen {
-            last_fg = fg;
-            last_screen = scr;
+        ticks = ticks.wrapping_add(1);
+        let now = snapshot();
+        if now != last {
+            last = now;
             pending = 4;
         }
-        if pending == 0 {
+        let maximized = now.4;
+        if pending == 0 && !(maximized && ticks % 8 == 0) {
             return;
         }
-        pending -= 1;
+        pending = pending.saturating_sub(1);
         if unsafe { IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 } {
             return;
         }

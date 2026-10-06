@@ -34,10 +34,6 @@ pub struct Config {
     pub sc_show: String,
     pub browser: u8,
     pub logged_in: bool,
-    /// Fuente activa: "yt" (YouTube Music) o "sp" (Spotify).
-    pub source: String,
-    /// Client ID propio de Spotify para la Web API (opcional; evita el limite 429 compartido).
-    pub spotify_client_id: String,
     /// Nombre con el que te ven en un Jam.
     pub jam_name: String,
     /// Puerto que abre el anfitrion de un Jam.
@@ -75,8 +71,6 @@ impl Default for Config {
             sc_show: "Control+Shift+KeyY".into(),
             browser: 0,
             logged_in: false,
-            source: "yt".into(),
-            spotify_client_id: String::new(),
             jam_name: std::env::var("USERNAME").unwrap_or_default(),
             jam_port: crate::jam::DEFAULT_PORT,
             jam_last_address: String::new(),
