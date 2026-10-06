@@ -36,10 +36,8 @@ pub struct Config {
     pub logged_in: bool,
     /// Nombre con el que te ven en un Jam.
     pub jam_name: String,
-    /// Puerto que abre el anfitrion de un Jam.
-    pub jam_port: u16,
-    /// Ultima direccion a la que te uniste.
-    pub jam_last_address: String,
+    /// Ultimo Jam (nombre de la sala) que creaste o al que te uniste.
+    pub jam_room: String,
 }
 
 impl Default for Config {
@@ -72,8 +70,7 @@ impl Default for Config {
             browser: 0,
             logged_in: false,
             jam_name: std::env::var("USERNAME").unwrap_or_default(),
-            jam_port: crate::jam::DEFAULT_PORT,
-            jam_last_address: String::new(),
+            jam_room: String::new(),
         }
     }
 }

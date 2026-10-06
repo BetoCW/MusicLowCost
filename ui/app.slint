@@ -1,5 +1,5 @@
 // Interfaz nativa de YoutubeInRustWeb (Slint, renderizado por software: ~6 MB).
-import { LineEdit, Switch, Button, ComboBox, ScrollView, ListView } from "std-widgets.slint";
+import { LineEdit, Switch, Button, ComboBox, ScrollView, ListView, Slider } from "std-widgets.slint";
 
 export struct TrackRow {
     id: string,
@@ -22,6 +22,11 @@ export struct CardRow {
 
 export global AppState {
     in-out property <string> page: "home";
+    in property <bool> can-back;
+    in property <bool> can-forward;
+    // Boton UpDate: rojo si hay una version nueva.
+    in property <bool> update-available;
+    in property <string> update-tip;
     in property <bool> loading;
     in property <string> status;
     in property <bool> logged-in;
@@ -66,17 +71,18 @@ export global AppState {
     in property <string> jam-role: "off"; // "off" | "host" | "guest"
     in property <string> jam-status;
     in property <string> jam-sync;
-    in property <string> jam-code;
-    in property <string> jam-address;
     in property <[string]> jam-peers;
     in property <[string]> jam-queue;
     in-out property <string> jam-name;
-    in-out property <int> jam-port: 26541;
-    in-out property <string> jam-join-address;
-    in-out property <string> jam-join-code;
+    in-out property <string> jam-room;
+    in-out property <string> jam-password;
 
     callback navigate(string);
+    callback back();
+    callback forward();
+    callback update-click();
     callback search(string);
+    callback search-typed(string);
     callback play-track(string, int); // lista, indice
     callback enqueue(string, int);
     callback open-card(string, string); // kind, id
@@ -91,13 +97,17 @@ export global AppState {
     callback toggle-shuffle();
     callback cycle-repeat();
     callback queue-remove(int);
+    callback queue-move(int, int); // de, a
     callback queue-clear();
     callback save-settings();
     callback login(string);
     callback logout();
     callback lastfm-connect();
-    callback jam-host(string, int); // nombre, puerto
-    callback jam-join(string, string, string); // nombre, direccion, codigo
+    callback jam-host(string, string, string); // tu nombre, sala, contraseña
+    callback jam-join(string, string, string); // tu nombre, sala, contraseña
+    // Ecualizador: vista previa mientras se arrastra, preajustes.
+    callback eq-changed(int, float);
+    callback eq-preset(int);
     callback jam-leave();
 }
 
@@ -113,6 +123,8 @@ export global Cfg {
     in-out property <bool> sponsorblock;
     in-out property <bool> discord;
     in-out property <bool> lastfm;
+    in-out property <bool> eq-enabled;
+    in property <[float]> eq: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     in property <string> lastfm-status;
     in property <string> account-status;
 }
@@ -137,6 +149,61 @@ component IconButton inherits Rectangle {
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
+    }
+}
+
+component NavArrow inherits Rectangle {
+    in property <string> glyph;
+    in property <string> tip;
+    in property <bool> enabled: true;
+    callback clicked;
+    width: 34px;
+    height: 34px;
+    border-radius: 17px;
+    background: !root.enabled ? #ffffff08 : ta.pressed ? #ffffff40 : ta.has-hover ? #ffffff26 : #ffffff14;
+    Text {
+        text: root.glyph;
+        color: root.enabled ? #fff : #555;
+        font-size: 24px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Rojo: hay una version nueva (un clic la instala). Blanco: al dia.
+component UpdateButton inherits Rectangle {
+    property <bool> on: AppState.update-available;
+    height: 30px;
+    width: label.preferred-width + 28px;
+    border-radius: 15px;
+    background: root.on ? (ta.pressed ? #c62828 : ta.has-hover ? #ff6b63 : Theme.accent) : (ta.has-hover ? #ffffff1f : transparent);
+    border-width: root.on ? 0px : 1px;
+    border-color: #ffffffaa;
+    label := Text {
+        text: root.on ? "⬇ UpDate" : "UpDate";
+        color: #fff;
+        font-size: 13px;
+        font-weight: root.on ? 700 : 400;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { AppState.update-click(); }
+    }
+    if ta.has-hover && AppState.update-tip != "": Rectangle {
+        x: parent.width - self.width;
+        y: parent.height + 4px;
+        width: tip.preferred-width + 16px;
+        height: 26px;
+        border-radius: 4px;
+        background: #333;
+        tip := Text { text: AppState.update-tip; color: #fff; font-size: 12px; vertical-alignment: center; horizontal-alignment: center; }
     }
 }
 
@@ -201,21 +268,72 @@ component Cover inherits Rectangle {
 component TrackItem inherits Rectangle {
     in property <TrackRow> item;
     in property <int> index;
+    in property <int> count;
     in property <bool> removable;
+    // Cola: se puede arrastrar para cambiar el orden.
+    in property <bool> draggable;
+    in property <int> drag-from: -1;
+    in property <int> drop-at: -1;
     callback play(int);
     callback add(int);
     callback remove(int);
+    callback drag-move(int, int); // de, a
+    callback drag-end(int, int);
+    property <bool> dragging;
+    property <length> press-y;
+    // Fila a la que se esta arrastrando, segun cuanto se movio el raton.
+    property <int> target: clamp(root.index + round((ta.mouse-y - root.press-y) / root.height), 0, max(0, root.count - 1));
     height: 56px;
-    background: root.item.current ? #ffffff1f : ta.has-hover ? #ffffff0d : transparent;
+    background: root.drag-from == root.index ? #ffffff26 : root.item.current ? #ffffff1f : ta.has-hover ? #ffffff0d : transparent;
     border-radius: 6px;
     ta := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.play(root.index); }
+        mouse-cursor: root.dragging ? MouseCursor.grabbing : MouseCursor.pointer;
+        // `clicked` llega antes que el pointer-event "up": si fue un arrastre no se toca.
+        clicked => {
+            if (!root.dragging) { root.play(root.index); }
+        }
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down) {
+                root.press-y = self.mouse-y;
+                root.dragging = false;
+            }
+            if (ev.kind == PointerEventKind.up || ev.kind == PointerEventKind.cancel) {
+                if (root.dragging) {
+                    root.dragging = false;
+                    root.drag-end(root.index, root.target);
+                }
+            }
+        }
+        moved => {
+            if (self.pressed && root.draggable) {
+                if (!root.dragging && abs(self.mouse-y - root.press-y) > 6px) {
+                    root.dragging = true;
+                }
+                if (root.dragging) {
+                    root.drag-move(root.index, root.target);
+                }
+            }
+        }
+    }
+    // Donde va a caer la cancion arrastrada.
+    if root.drop-at == root.index && root.drag-from >= 0 && root.drag-from != root.index: Rectangle {
+        x: 0;
+        y: root.drag-from > root.index ? 0 : parent.height - self.height;
+        width: parent.width;
+        height: 3px;
+        background: Theme.accent;
     }
     HorizontalLayout {
         padding-left: 10px;
         padding-right: 6px;
         spacing: 12px;
+        if root.draggable: Text {
+            text: "⠿";
+            color: #777;
+            font-size: 16px;
+            vertical-alignment: center;
+            width: 12px;
+        }
         VerticalLayout {
             alignment: center;
             Cover { source: root.item.cover; size: 40px; }
@@ -267,25 +385,111 @@ component CardItem inherits Rectangle {
     }
 }
 
-component TrackList inherits ListView {
-    in property <[TrackRow]> rows;
-    in property <string> list;
-    in property <bool> removable;
-    for row[i] in root.rows: TrackItem {
-        item: row;
-        index: i;
-        removable: root.removable;
-        play(i) => { AppState.play-track(root.list, i); }
-        add(i) => { AppState.enqueue(root.list, i); }
-        remove(i) => { AppState.queue-remove(i); }
+// Barra de desplazamiento propia: mas ancha que la del estilo y separada del contenido.
+component VScrollBar inherits Rectangle {
+    in property <length> content-height;
+    in property <length> visible-height;
+    in-out property <length> content-y;
+    property <length> max-scroll: max(0px, root.content-height - root.visible-height);
+    property <length> thumb-h: min(root.height, max(40px, root.height * root.visible-height / max(root.content-height, 1px)));
+    property <length> track: max(1px, root.height - root.thumb-h);
+    property <length> thumb-y: root.max-scroll > 0 ? clamp(-root.content-y / root.max-scroll, 0, 1) * root.track : 0px;
+    property <length> grab;
+    width: 12px;
+    border-radius: 6px;
+    background: root.max-scroll > 0 ? #ffffff10 : transparent;
+    function scroll-to(y: length) {
+        root.content-y = -clamp((y - root.grab) / root.track, 0, 1) * root.max-scroll;
+    }
+    if root.max-scroll > 0: Rectangle {
+        x: 0;
+        y: root.thumb-y;
+        width: parent.width;
+        height: root.thumb-h;
+        border-radius: 6px;
+        background: ta.pressed ? #ffffffb0 : ta.has-hover ? #ffffff80 : #ffffff4d;
+    }
+    ta := TouchArea {
+        enabled: root.max-scroll > 0;
+        mouse-cursor: pointer;
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down) {
+                // Se agarra la barra donde se toco; fuera de ella, salta a esa posicion.
+                if (self.mouse-y >= root.thumb-y && self.mouse-y <= root.thumb-y + root.thumb-h) {
+                    root.grab = self.mouse-y - root.thumb-y;
+                } else {
+                    root.grab = root.thumb-h / 2;
+                    root.scroll-to(self.mouse-y);
+                }
+            }
+        }
+        moved => {
+            if (self.pressed) { root.scroll-to(self.mouse-y); }
+        }
+        scroll-event(ev) => {
+            root.content-y = clamp(root.content-y + ev.delta-y, -root.max-scroll, 0px);
+            accept
+        }
     }
 }
 
-component CardList inherits ListView {
+component TrackList inherits HorizontalLayout {
+    in property <[TrackRow]> rows;
+    in property <string> list;
+    in property <bool> removable;
+    // Cola: arrastrar una cancion la cambia de lugar.
+    in property <bool> reorder;
+    property <int> drag-from: -1;
+    property <int> drop-at: -1;
+    spacing: 10px;
+    vertical-stretch: 1;
+    lv := ListView {
+        vertical-scrollbar-policy: always-off;
+        mouse-drag-pan-enabled: false;
+        for row[i] in root.rows: TrackItem {
+            item: row;
+            index: i;
+            count: root.rows.length;
+            removable: root.removable;
+            draggable: root.reorder;
+            drag-from: root.drag-from;
+            drop-at: root.drop-at;
+            play(i) => { AppState.play-track(root.list, i); }
+            add(i) => { AppState.enqueue(root.list, i); }
+            remove(i) => { AppState.queue-remove(i); }
+            drag-move(from, to) => {
+                root.drag-from = from;
+                root.drop-at = to;
+            }
+            drag-end(from, to) => {
+                root.drag-from = -1;
+                root.drop-at = -1;
+                if (from != to) { AppState.queue-move(from, to); }
+            }
+        }
+    }
+    VScrollBar {
+        content-height: lv.content-height;
+        visible-height: lv.visible-height;
+        content-y <=> lv.content-y;
+    }
+}
+
+component CardList inherits HorizontalLayout {
     in property <[CardRow]> rows;
-    for row in root.rows: CardItem {
-        item: row;
-        open(kind, id) => { AppState.open-card(kind, id); }
+    spacing: 10px;
+    vertical-stretch: 1;
+    lv := ListView {
+        vertical-scrollbar-policy: always-off;
+        for row in root.rows: CardItem {
+            item: row;
+            open(kind, id) => { AppState.open-card(kind, id); }
+        }
+    }
+    VScrollBar {
+        content-height: lv.content-height;
+        visible-height: lv.visible-height;
+        content-y <=> lv.content-y;
     }
 }
 
@@ -299,6 +503,12 @@ component Empty inherits Text {
     color: #888;
     font-size: 14px;
     horizontal-alignment: center;
+}
+
+component Hint inherits Text {
+    color: #777;
+    font-size: 12px;
+    wrap: word-wrap;
 }
 
 component HomePage inherits VerticalLayout {
@@ -320,7 +530,9 @@ component SearchPage inherits VerticalLayout {
     spacing: 12px;
     PageTitle { text: "Buscar"; }
     LineEdit {
-        placeholder-text: "Canciones, álbumes, artistas, listas… (Enter)";
+        placeholder-text: "Canciones, álbumes, artistas, listas…";
+        // Busca mientras se escribe (el backend espera a que se deje de teclear).
+        edited(text) => { AppState.search-typed(text); }
         accepted(text) => { AppState.search(text); }
     }
     HorizontalLayout {
@@ -390,7 +602,8 @@ component QueuePage inherits VerticalLayout {
         Button { text: "Vaciar"; clicked => { AppState.queue-clear(); } }
     }
     if AppState.queue.length == 0: Empty { text: "La cola está vacía"; }
-    TrackList { rows: AppState.queue; list: "queue"; removable: true; }
+    if AppState.queue.length > 1: Hint { text: "Mantén presionada una canción y muévela para cambiarla de lugar."; }
+    TrackList { rows: AppState.queue; list: "queue"; removable: true; reorder: true; }
 }
 
 component LyricsPage inherits VerticalLayout {
@@ -421,6 +634,21 @@ component LyricsPage inherits VerticalLayout {
     }
 }
 
+// ScrollView con la barra propia (VScrollBar).
+component Scroller inherits HorizontalLayout {
+    spacing: 10px;
+    vertical-stretch: 1;
+    sv := ScrollView {
+        vertical-scrollbar-policy: always-off;
+        @children
+    }
+    VScrollBar {
+        content-height: sv.content-height;
+        visible-height: sv.visible-height;
+        content-y <=> sv.content-y;
+    }
+}
+
 component Section inherits VerticalLayout {
     in property <string> title;
     spacing: 6px;
@@ -441,14 +669,47 @@ component Option inherits Switch {
     toggled => { AppState.save-settings(); }
 }
 
-// Solo lo que entiende cualquiera. Lo avanzado (ecualizador, atajos, API local,
-// puertos...) sigue funcionando desde config.json, pero no se muestra.
+// Ecualizador de 10 bandas: se escucha mientras se arrastra y se guarda al soltar.
+component Equalizer inherits VerticalLayout {
+    property <[string]> labels: ["60", "170", "310", "600", "1k", "3k", "6k", "12k", "14k", "16k"];
+    spacing: 8px;
+    HorizontalLayout {
+        spacing: 4px;
+        alignment: start;
+        for g[i] in Cfg.eq: VerticalLayout {
+            width: 46px;
+            spacing: 4px;
+            Text { text: (g > 0 ? "+" : "") + round(g); color: #aaa; font-size: 11px; horizontal-alignment: center; }
+            Slider {
+                height: 140px;
+                orientation: vertical;
+                minimum: -12;
+                maximum: 12;
+                value: g;
+                changed(v) => { AppState.eq-changed(i, v); }
+                released(v) => { AppState.save-settings(); }
+            }
+            Text { text: root.labels[i]; color: #888; font-size: 11px; horizontal-alignment: center; }
+        }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+        Button { text: "Plano"; clicked => { AppState.eq-preset(0); } }
+        Button { text: "Más graves"; clicked => { AppState.eq-preset(1); } }
+        Button { text: "Voces"; clicked => { AppState.eq-preset(2); } }
+        Button { text: "Más agudos"; clicked => { AppState.eq-preset(3); } }
+    }
+}
+
+// Solo lo que entiende cualquiera. Lo avanzado (atajos, API local, puertos...)
+// sigue funcionando desde config.json, pero no se muestra.
 component SettingsPage inherits VerticalLayout {
     spacing: 12px;
     PageTitle { text: "Ajustes"; }
-    ScrollView {
+    Scroller {
         VerticalLayout {
-            padding-right: 16px;
+            padding-right: 6px;
             alignment: start;
             Section {
                 title: "Reproducción";
@@ -465,6 +726,11 @@ component SettingsPage inherits VerticalLayout {
                         selected => { AppState.save-settings(); }
                     }
                 }
+            }
+            Section {
+                title: "Ecualizador";
+                Option { text: "Usar ecualizador"; checked <=> Cfg.eq-enabled; }
+                if Cfg.eq-enabled: Equalizer { }
             }
             Section {
                 title: "Tu cuenta de YouTube (opcional)";
@@ -502,12 +768,6 @@ component SettingsPage inherits VerticalLayout {
         }
     }
 }
-component Hint inherits Text {
-    color: #777;
-    font-size: 12px;
-    wrap: word-wrap;
-}
-
 component JamPage inherits VerticalLayout {
     spacing: 12px;
     HorizontalLayout {
@@ -519,53 +779,50 @@ component JamPage inherits VerticalLayout {
         }
     }
     Text {
-        text: "Escuchen lo mismo al mismo tiempo, cada quien en su computadora.";
+        text: "Escuchen lo mismo al mismo tiempo, cada quien en su casa. Solo hace falta internet.";
         color: #aaa;
         wrap: word-wrap;
     }
     if AppState.jam-status != "": Text { text: AppState.jam-status; color: #ffb74d; wrap: word-wrap; }
     if AppState.jam-role == "guest" && AppState.jam-sync != "": Hint { text: AppState.jam-sync; }
 
-    if AppState.jam-role == "off": ScrollView {
-        vertical-stretch: 1;
+    if AppState.jam-role == "off": Scroller {
         VerticalLayout {
-            padding-right: 16px;
+            padding-right: 6px;
             alignment: start;
             Section {
                 title: "Tu nombre";
                 LineEdit { placeholder-text: "Cómo te ven los demás"; text <=> AppState.jam-name; }
             }
             Section {
-                title: "Crear un Jam";
+                title: "El Jam";
+                Field { label: "Nombre del Jam"; LineEdit { placeholder-text: "Por ejemplo: viernes con Ana"; text <=> AppState.jam-room; } }
+                Field { label: "Contraseña"; LineEdit { input-type: password; placeholder-text: "Al menos 4 caracteres"; text <=> AppState.jam-password; } }
                 Hint {
-                    text: "Funciona con personas conectadas a tu misma red (wifi de tu casa). Si Windows pregunta por el firewall, acepta.";
+                    text: "Quien crea el Jam elige un nombre y una contraseña y se los pasa a los demás. Para entrar se escriben los mismos (el nombre no distingue mayúsculas; la contraseña sí).";
                 }
                 HorizontalLayout {
-                    alignment: start;
-                    Button { text: "Crear Jam"; primary: true; clicked => { AppState.jam-host(AppState.jam-name, AppState.jam-port); } }
-                }
-            }
-            Section {
-                title: "Unirse a un Jam";
-                Field { label: "Dirección"; LineEdit { placeholder-text: "La que te pasó el anfitrión"; text <=> AppState.jam-join-address; } }
-                Field { label: "Código"; LineEdit { placeholder-text: "ABC123"; text <=> AppState.jam-join-code; } }
-                Hint { text: "Mientras estés en el Jam, lo que toques se agrega a la cola del anfitrión y los controles del reproductor le piden a él pausar, saltar o adelantar."; }
-                HorizontalLayout {
+                    spacing: 10px;
                     alignment: start;
                     Button {
-                        text: "Unirse";
+                        text: "Crear Jam";
                         primary: true;
-                        clicked => { AppState.jam-join(AppState.jam-name, AppState.jam-join-address, AppState.jam-join-code); }
+                        clicked => { AppState.jam-host(AppState.jam-name, AppState.jam-room, AppState.jam-password); }
+                    }
+                    Button {
+                        text: "Unirme";
+                        clicked => { AppState.jam-join(AppState.jam-name, AppState.jam-room, AppState.jam-password); }
                     }
                 }
+                Hint { text: "Mientras estés en el Jam de alguien, lo que toques se agrega a su cola y los controles del reproductor le piden a él pausar, saltar o adelantar."; }
             }
         }
     }
 
     if AppState.jam-role == "host": Section {
         title: "Para invitar, comparte esto";
-        Field { label: "Dirección"; LineEdit { text: AppState.jam-address; read-only: true; } }
-        Field { label: "Código"; LineEdit { text: AppState.jam-code; read-only: true; } }
+        Field { label: "Nombre del Jam"; LineEdit { text: AppState.jam-room; read-only: true; } }
+        Field { label: "Contraseña"; LineEdit { text: AppState.jam-password; read-only: true; } }
     }
 
     if AppState.jam-role != "off": Section {
@@ -723,8 +980,6 @@ export component AppWindow inherits Window {
     min-height: 480px;
     background: #0f0f0f;
     default-font-size: 14px;
-    // Cambiarlo obliga a redibujar la ventana entera (ver desktop::watch_repaint).
-    in-out property <bool> repaint-flip;
 
     VerticalLayout {
         HorizontalLayout {
@@ -757,8 +1012,17 @@ export component AppWindow inherits Window {
                 horizontal-stretch: 1;
                 VerticalLayout {
                     padding: 20px;
+                    padding-top: 10px;
                     padding-bottom: 8px;
                     spacing: 8px;
+                    // Atras / adelante entre pantallas.
+                    HorizontalLayout {
+                        spacing: 6px;
+                        NavArrow { glyph: "‹"; enabled: AppState.can-back; tip: "Atrás"; clicked => { AppState.back(); } }
+                        NavArrow { glyph: "›"; enabled: AppState.can-forward; tip: "Adelante"; clicked => { AppState.forward(); } }
+                        Rectangle { horizontal-stretch: 1; }
+                        UpdateButton { }
+                    }
                     if AppState.page == "home": HomePage { vertical-stretch: 1; }
                     if AppState.page == "search": SearchPage { vertical-stretch: 1; }
                     if AppState.page == "detail": DetailPage { vertical-stretch: 1; }
@@ -779,15 +1043,6 @@ export component AppWindow inherits Window {
         PlayerBar { }
     }
 
-    // Capa invisible sobre toda la ventana: al cambiar su color, el renderer por software
-    // marca toda la ventana como sucia y la repinta completa (no solo las partes que cambiaron).
-    Rectangle {
-        x: 0;
-        y: 0;
-        width: root.width;
-        height: root.height;
-        background: root.repaint-flip ? #00000001 : #00000000;
-    }
 }
 
 // Ventana del proceso `--login` (el WebView de Google se dibuja encima).

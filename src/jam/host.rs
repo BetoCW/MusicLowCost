@@ -1,6 +1,7 @@
 //! Anfitrion: acepta invitados, les reparte el audio de la cancion actual y el estado
 //! de reproduccion, y le pasa al backend lo que piden.
 
+use super::net::{self, Keep, Rd, Wr};
 use super::protocol::{self, CHUNK, Frame, Msg, Request, VERSION};
 use super::{Event, MAX_GUESTS, PlayState, clean_name, clock::micros_since};
 use crate::backend::Cmd;
@@ -9,8 +10,6 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::AbortHandle;
 
@@ -23,7 +22,6 @@ type Current = (Track, Option<Arc<[u8]>>);
 pub struct Host {
     inner: Rc<Inner>,
     accept: AbortHandle,
-    port: u16,
 }
 
 struct Inner {
@@ -41,6 +39,8 @@ struct Inner {
     current: RefCell<Option<Current>>,
     state: Cell<Option<PlayState>>,
     queue: RefCell<Vec<Track>>,
+    /// Para cerrarlo bien al terminar el Jam.
+    endpoint: RefCell<Option<iroh::Endpoint>>,
 }
 
 struct Peer {
@@ -59,57 +59,43 @@ enum Out {
 }
 
 impl Host {
-    /// Abre el puerto (en todas las interfaces) y empieza a aceptar invitados.
-    pub fn start(port: u16, name: &str, code: String, tx: UnboundedSender<Cmd>, id: u32) -> Result<Host, String> {
-        let std_listener = std::net::TcpListener::bind(("0.0.0.0", port))
-            .map_err(|e| format!("no se pudo abrir el puerto {port}: {e}"))?;
-        std_listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        let port = std_listener.local_addr().map_err(|e| e.to_string())?.port();
-        let listener = tokio::net::TcpListener::from_std(std_listener).map_err(|e| e.to_string())?;
-        let inner = Rc::new(Inner {
-            id,
-            epoch: Instant::now(),
-            code,
-            name: clean_name(name, "Anfitrión"),
-            tx,
-            peers: RefCell::new(Vec::new()),
-            conns: RefCell::new(Vec::new()),
-            next_peer: Cell::new(1),
-            tag: Rc::new(Cell::new(0)),
-            current: RefCell::new(None),
-            state: Cell::new(None),
-            queue: RefCell::new(Vec::new()),
-        });
-        let inner2 = inner.clone();
+    /// Abre la sala `room` (con su contraseña) en internet y empieza a aceptar invitados.
+    /// Si algo falla llega `Event::Ended`; cuando esta lista, `Event::Status`.
+    pub fn start(room: &str, password: &str, name: &str, tx: UnboundedSender<Cmd>, id: u32) -> Host {
+        let inner = Inner::new(password, name, tx, id);
+        let (inner2, room, password) = (inner.clone(), room.to_string(), password.to_string());
         let accept = tokio::task::spawn_local(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, addr)) => {
-                        log::info!("jam: conexion de {addr}");
-                        let h = tokio::task::spawn_local(handle_peer(inner2.clone(), stream)).abort_handle();
-                        let mut conns = inner2.conns.borrow_mut();
-                        conns.retain(|c| !c.is_finished());
-                        conns.push(h);
-                    }
-                    Err(e) => {
-                        log::warn!("jam: accept: {e}");
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
+            let ep = match net::host_endpoint(&room, &password).await {
+                Ok(ep) => ep,
+                Err(e) => return inner2.event(Event::Ended(e)),
+            };
+            *inner2.endpoint.borrow_mut() = Some(ep.clone());
+            log::info!("jam: sala lista ({})", ep.id());
+            inner2.event(Event::Status("Jam listo. Comparte el nombre y la contraseña con quien quieras invitar.".into()));
+            while let Some(conn) = net::accept(&ep).await {
+                match conn {
+                    Ok((rd, wr, keep)) => inner2.add_peer(rd, wr, keep),
+                    Err(e) => log::info!("jam: conexión fallida: {e}"),
                 }
             }
         })
         .abort_handle();
-        log::info!("jam: anfitrion en el puerto {port}");
-        Ok(Host { inner, accept, port })
+        Host { inner, accept }
     }
 
-    /// Puerto real (si se pidio el 0, el que eligio el sistema).
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-
-    pub fn code(&self) -> &str {
-        &self.inner.code
+    /// Para las pruebas: anfitrion en un puerto TCP local (sin internet).
+    #[cfg(test)]
+    pub fn start_tcp(listener: tokio::net::TcpListener, password: &str, name: &str, tx: UnboundedSender<Cmd>, id: u32) -> Host {
+        let inner = Inner::new(password, name, tx, id);
+        let inner2 = inner.clone();
+        let accept = tokio::task::spawn_local(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (rd, wr) = stream.into_split();
+                inner2.add_peer(Box::new(rd), Box::new(wr), Box::new(()));
+            }
+        })
+        .abort_handle();
+        Host { inner, accept }
     }
 
     /// Hora del anfitrion en microsegundos.
@@ -158,11 +144,39 @@ impl Drop for Host {
         for p in self.inner.peers.borrow_mut().drain(..) {
             p.writer.abort();
         }
+        if let Some(ep) = self.inner.endpoint.borrow_mut().take() {
+            tokio::task::spawn_local(async move { ep.close().await });
+        }
         log::info!("jam: anfitrion cerrado");
     }
 }
 
 impl Inner {
+    fn new(password: &str, name: &str, tx: UnboundedSender<Cmd>, id: u32) -> Rc<Inner> {
+        Rc::new(Inner {
+            id,
+            epoch: Instant::now(),
+            code: password.to_string(),
+            name: clean_name(name, "Anfitrión"),
+            tx,
+            peers: RefCell::new(Vec::new()),
+            conns: RefCell::new(Vec::new()),
+            next_peer: Cell::new(1),
+            tag: Rc::new(Cell::new(0)),
+            current: RefCell::new(None),
+            state: Cell::new(None),
+            queue: RefCell::new(Vec::new()),
+            endpoint: RefCell::new(None),
+        })
+    }
+
+    fn add_peer(self: &Rc<Self>, rd: Rd, wr: Wr, keep: Keep) {
+        let h = tokio::task::spawn_local(handle_peer(self.clone(), rd, wr, keep)).abort_handle();
+        let mut conns = self.conns.borrow_mut();
+        conns.retain(|c| !c.is_finished());
+        conns.push(h);
+    }
+
     fn event(&self, e: Event) {
         let _ = self.tx.send(Cmd::Jam(self.id, e));
     }
@@ -202,13 +216,11 @@ fn send_current(inner: &Inner, p: &Peer) {
     }
 }
 
-async fn reject(mut wr: OwnedWriteHalf, reason: &str) {
+async fn reject(mut wr: Wr, reason: &str) {
     let _ = protocol::write_msg(&mut wr, &Msg::Reject { reason: reason.into() }).await;
 }
 
-async fn handle_peer(inner: Rc<Inner>, stream: TcpStream) {
-    let _ = stream.set_nodelay(true);
-    let (mut rd, wr) = stream.into_split();
+async fn handle_peer(inner: Rc<Inner>, mut rd: Rd, wr: Wr, _keep: Keep) {
     // Lo primero tiene que ser un Hello valido, y pronto.
     let hello = tokio::time::timeout(Duration::from_secs(5), protocol::read_frame(&mut rd)).await;
     let name = match hello {
@@ -216,8 +228,8 @@ async fn handle_peer(inner: Rc<Inner>, stream: TcpStream) {
             if v != VERSION {
                 return reject(wr, "Versión distinta de la app: actualicen los dos a la última.").await;
             }
-            if !code.trim().eq_ignore_ascii_case(&inner.code) {
-                return reject(wr, "Código incorrecto.").await;
+            if code != inner.code {
+                return reject(wr, "Contraseña incorrecta.").await;
             }
             clean_name(&name, "Invitado")
         }
@@ -256,7 +268,7 @@ async fn handle_peer(inner: Rc<Inner>, stream: TcpStream) {
     }
 }
 
-async fn read_loop(inner: &Inner, rd: &mut OwnedReadHalf, pid: u64, name: &str) -> String {
+async fn read_loop(inner: &Inner, rd: &mut Rd, pid: u64, name: &str) -> String {
     loop {
         let frame = match protocol::read_frame(rd).await {
             Ok(f) => f,
@@ -287,7 +299,7 @@ async fn read_loop(inner: &Inner, rd: &mut OwnedReadHalf, pid: u64, name: &str) 
     }
 }
 
-async fn write_out(wr: &mut OwnedWriteHalf, o: Out, epoch: Instant) -> std::io::Result<()> {
+async fn write_out(wr: &mut Wr, o: Out, epoch: Instant) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     match o {
         Out::Bytes(b) => wr.write_all(&b).await,
@@ -298,7 +310,7 @@ async fn write_out(wr: &mut OwnedWriteHalf, o: Out, epoch: Instant) -> std::io::
 /// Escribe al invitado: primero el control (para que el reloj y el estado no esperen
 /// detras del audio) y luego el audio en pedazos, abandonando el de canciones viejas.
 async fn writer(
-    mut wr: OwnedWriteHalf,
+    mut wr: Wr,
     mut ctrl: UnboundedReceiver<Out>,
     mut audio: UnboundedReceiver<(u32, Arc<[u8]>)>,
     tag: Rc<Cell<u32>>,

@@ -1,0 +1,10 @@
+{
+  "exclude": [
+    "target/**",
+    "**/target/**",
+    "vendor/**",
+    "version-webview/**",
+    "package-lock.json"
+  ],
+  "deprioritize": []
+}

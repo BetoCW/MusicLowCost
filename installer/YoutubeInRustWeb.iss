@@ -3,7 +3,7 @@
 ; Output:  installer\Output\YoutubeInRustWeb-Setup.exe
 
 #define AppName "YoutubeInRustWeb"
-#define AppVersion "0.4.0"
+#define AppVersion "0.5.0"
 #define AppExe "YoutubeInRustWeb.exe"
 
 [Setup]
@@ -51,6 +51,8 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; Actualizacion desde el boton UpDate (instalador en silencio): se vuelve a abrir sola.
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: WizardSilent
 
 [UninstallDelete]
 ; Components downloaded by the app (yt-dlp / deno). Settings and sessions are kept.

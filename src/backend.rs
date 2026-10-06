@@ -6,13 +6,13 @@ use crate::config::{self, Config};
 use crate::images::Images;
 use crate::integrations::{api_server, discord, lyrics, scrobbler, sponsorblock};
 use crate::model::{self, Card, CardKind, Track, fmt_time};
-use crate::stream;
+use crate::stream::{self, Growing};
 use crate::ui::{CardListKind, ListKind, Ui};
 use crate::{AppState, Cfg, desktop};
 use rustypipe::client::RustyPipe;
 use rustypipe::param::Country;
 use serde::{Deserialize, Serialize};
-use slint::ComponentHandle;
+use slint::{ComponentHandle, Model};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,7 +28,13 @@ use jam_link::Jam;
 #[derive(Debug)]
 pub enum Cmd {
     Navigate(String),
+    /// Flechas de atras / adelante.
+    Back,
+    Forward,
+    /// Buscar ya (Enter).
     Search(String),
+    /// Buscar mientras se escribe (espera a que se deje de escribir).
+    SearchTyped(String),
     PlayTrack(String, usize),
     Enqueue(String, usize),
     OpenCard(String, String),
@@ -45,19 +51,32 @@ pub enum Cmd {
     ToggleShuffle,
     CycleRepeat,
     QueueRemove(usize),
+    /// Arrastrar una cancion de la cola: de, a.
+    QueueMove(usize, usize),
     QueueClear,
     SaveSettings(UiSettings),
+    /// Como SaveSettings pero sin escribir config.json (ecualizador mientras se arrastra).
+    PreviewSettings(UiSettings),
     Login(String),
     Logout,
     LastfmConnect,
     SaveSession,
-    /// Crear un Jam: nombre, puerto.
-    JamHost(String, u16),
-    /// Unirse a un Jam: nombre, direccion, codigo.
+    /// Boton UpDate: instala la version nueva (o revisa si hay una).
+    UpdateClick,
+    /// Crear un Jam: tu nombre, nombre de la sala, contraseña.
+    JamHost(String, String, String),
+    /// Unirse a un Jam: tu nombre, nombre de la sala, contraseña.
     JamJoin(String, String, String),
     JamLeave,
     /// Aviso del Jam con ese id.
     Jam(u32, crate::jam::Event),
+}
+
+/// Una pantalla del historial (para las flechas de atras / adelante).
+#[derive(Debug, Clone, PartialEq)]
+enum Nav {
+    Page(String),
+    Detail(CardKind, String),
 }
 
 /// Se guarda en session.json para retomar la cola al abrir.
@@ -82,7 +101,7 @@ struct State {
     repeat: u8,
     current: Option<Track>,
     /// Audio de la cancion actual (para repetir sin volver a descargar).
-    current_data: Option<Arc<[u8]>>,
+    current_data: Option<Arc<Growing>>,
     play_seq: u64,
     buffering: bool,
     restore_position: Option<f64>,
@@ -97,14 +116,28 @@ struct State {
     lyrics: Vec<(u64, String)>,
     lyrics_idx: i32,
     segments: Vec<[f64; 2]>,
-    prefetch: Option<(String, Arc<[u8]>)>,
+    prefetch: Option<(String, Arc<Growing>)>,
     prefetching: Option<String>,
     radio_loading: bool,
     last_paused: bool,
     errors_in_row: u32,
     last_snapshot: Instant,
-    /// Canciones que agregaron invitados del Jam (se ponen en orden de llegada).
-    jam_added: std::collections::HashSet<String>,
+    /// Canciones que se agregaron a la cola a mano (o invitados del Jam) y todavia no
+    /// suenan: las nuevas van despues de estas, en orden de llegada.
+    added: std::collections::HashSet<String>,
+    /// Seek pedido mientras el audio todavia se descargaba.
+    pending_seek: Option<f64>,
+    /// Cuando empezo la ultima cancion (para no correr yt-dlp por cada salto rapido).
+    last_play_at: Instant,
+    /// El Jam ya tiene la cancion actual (si no, no se le manda el estado).
+    jam_ready: bool,
+    search_gen: u64,
+    /// Version nueva publicada (si hay) y si ya se esta instalando.
+    update: Option<crate::update::Release>,
+    updating: bool,
+    nav: Nav,
+    back: Vec<Nav>,
+    forward: Vec<Nav>,
 }
 
 pub struct Backend {
@@ -189,7 +222,16 @@ pub fn run(
                 last_paused: true,
                 errors_in_row: 0,
                 last_snapshot: Instant::now(),
-                jam_added: Default::default(),
+                added: Default::default(),
+                pending_seek: None,
+                last_play_at: Instant::now() - Duration::from_secs(10),
+                jam_ready: false,
+                search_gen: 0,
+                update: None,
+                updating: false,
+                nav: Nav::Page("home".into()),
+                back: Vec::new(),
+                forward: Vec::new(),
                 cfg,
             }),
         });
@@ -199,6 +241,7 @@ pub fn run(
         spawn(load_home(b.clone()));
         spawn(load_library(b.clone()));
         spawn(ticker(b.clone()));
+        spawn(update_loop(b.clone()));
         spawn(remove_login_webview());
         // Preparar yt-dlp en segundo plano (lo descarga la primera vez) y mantenerlo al dia.
         {
@@ -208,6 +251,7 @@ pub fn run(
                 match stream::ensure_tools(&b2.http, move |m| ui.status(m)).await {
                     Ok(_) => {
                         b2.ui.status("");
+                        let _ = tokio::task::spawn_blocking(stream::warm_up).await;
                         stream::maybe_self_update(&b2.http).await;
                     }
                     Err(e) => b2.ui.status(format!("No se pudo preparar yt-dlp: {e}")),
@@ -237,7 +281,8 @@ impl Backend {
         } else {
             cfg_country.trim().to_uppercase()
         };
-        let q = self.rp.query();
+        // Con sesion, todo va autenticado: listas privadas, «Me gusta» (LM) y recomendaciones.
+        let q = if self.rp.user_auth_cookie_header().is_some() { self.rp.query().authenticated() } else { self.rp.query() };
         match serde_json::from_value::<Country>(serde_json::Value::String(code)) {
             Ok(c) => q.country(c),
             Err(_) => q,
@@ -249,36 +294,37 @@ impl Backend {
             return;
         }
         match cmd {
-            Cmd::Navigate(page) => {
-                if page == "library" && self.cfg().logged_in {
-                    spawn(load_library(self.clone()));
-                }
-                self.ui.state(move |s| {
-                    s.set_page(page.into());
-                    s.set_status("".into());
-                });
-            }
-            Cmd::Search(q) => spawn(search(self.clone(), q)),
+            Cmd::Navigate(page) => self.go(Nav::Page(page), true),
+            Cmd::Back => self.history_step(true),
+            Cmd::Forward => self.history_step(false),
+            Cmd::Search(q) => self.start_search(q, false),
+            Cmd::SearchTyped(q) => self.start_search(q, true),
             Cmd::PlayTrack(list, i) => self.play_from_list(&list, i),
             Cmd::Enqueue(list, i) => {
                 let Some(kind) = ListKind::parse(&list) else { return };
                 let t = self.state.borrow().lists.get(&kind).and_then(|l| l.get(i).cloned());
                 if let Some(t) = t {
                     let title = t.title.clone();
-                    self.state.borrow_mut().queue.push(t);
+                    let (at, play_now) = self.insert_next(t, false);
                     self.push_queue();
-                    self.ui.status(format!("Agregada a la cola: {title}"));
+                    self.clear_prefetch();
+                    if play_now {
+                        self.play_index(at, true);
+                    } else {
+                        self.prefetch_next();
+                        self.ui.status(format!("Sonará después de la actual: {title}"));
+                    }
                 }
             }
             Cmd::OpenCard(kind, id) => {
                 if let Some(k) = CardKind::parse(&kind) {
-                    spawn(open_card(self.clone(), k, id));
+                    self.go(Nav::Detail(k, id), true);
                 }
             }
             Cmd::OpenArtistOfCurrent => {
                 let id = self.state.borrow().current.as_ref().and_then(|t| t.artist_id.clone());
                 if let Some(id) = id {
-                    spawn(open_card(self.clone(), CardKind::Artist, id));
+                    self.go(Nav::Detail(CardKind::Artist, id), true);
                 }
             }
             Cmd::PlayDetail(shuffle) => {
@@ -320,14 +366,14 @@ impl Backend {
             Cmd::Next => self.next(true),
             Cmd::Previous => {
                 if self.engine.position() > 3.0 {
-                    self.engine.seek(0.0);
+                    self.seek_to(0.0);
                     self.on_play_state();
                 } else {
                     let idx = self.state.borrow().index;
                     match idx {
                         Some(i) if i > 0 => self.play_index(i - 1, true),
                         _ => {
-                            self.engine.seek(0.0);
+                            self.seek_to(0.0);
                             self.on_play_state();
                         }
                     }
@@ -335,8 +381,7 @@ impl Backend {
             }
             Cmd::Seek(secs) => {
                 if self.engine.has_track() {
-                    self.engine.seek(secs);
-                    self.state.borrow_mut().lyrics_idx = -2;
+                    self.seek_to(secs);
                     self.on_play_state();
                 } else {
                     self.state.borrow_mut().restore_position = Some(secs);
@@ -393,6 +438,21 @@ impl Backend {
                 self.clear_prefetch();
                 self.prefetch_next();
             }
+            Cmd::QueueMove(from, to) => {
+                {
+                    let mut st = self.state.borrow_mut();
+                    let len = st.queue.len();
+                    if from >= len || to >= len || from == to {
+                        return;
+                    }
+                    let t = st.queue.remove(from);
+                    st.queue.insert(to, t);
+                    st.index = st.index.map(|cur| moved_index(cur, from, to));
+                }
+                self.push_queue();
+                self.clear_prefetch();
+                self.prefetch_next();
+            }
             Cmd::QueueClear => {
                 {
                     let mut st = self.state.borrow_mut();
@@ -400,6 +460,9 @@ impl Backend {
                     let cur = st.index.and_then(|i| st.queue.get(i).cloned());
                     st.queue = cur.into_iter().collect();
                     st.index = if st.queue.is_empty() { None } else { Some(0) };
+                    st.added.clear();
+                    // La radio que estuviera llegando ya no se agrega.
+                    st.queue_gen += 1;
                 }
                 self.push_queue();
                 self.clear_prefetch();
@@ -409,15 +472,109 @@ impl Backend {
                 config::save(&self.dir, &self.cfg());
                 self.apply_settings(false);
             }
+            Cmd::PreviewSettings(s) => {
+                s.apply(&mut self.state.borrow_mut().cfg);
+                let cfg = self.cfg();
+                self.engine.fx.set_eq(cfg.eq_enabled, cfg.eq);
+            }
             Cmd::Login(browser) => spawn(login(self.clone(), browser)),
             Cmd::Logout => spawn(logout(self.clone())),
             Cmd::LastfmConnect => spawn(lastfm_connect(self.clone())),
             Cmd::SaveSession => self.save_session(),
-            Cmd::JamHost(name, port) => self.jam_start_host(name, port),
-            Cmd::JamJoin(name, addr, code) => self.jam_join(name, addr, code),
+            Cmd::UpdateClick => spawn(update_click(self.clone())),
+            Cmd::JamHost(name, room, pass) => self.jam_start_host(name, room, pass),
+            Cmd::JamJoin(name, room, pass) => self.jam_join(name, room, pass),
             Cmd::JamLeave => self.jam_leave(None),
             Cmd::Jam(id, ev) => self.jam_event(id, ev),
         }
+    }
+
+    // ---------- navegacion ----------
+
+    fn go(self: &Rc<Self>, nav: Nav, record: bool) {
+        match nav.clone() {
+            Nav::Page(page) => {
+                if page == "library" && self.cfg().logged_in {
+                    spawn(load_library(self.clone()));
+                }
+                if record {
+                    self.record_nav(nav);
+                }
+                self.ui.state(move |s| {
+                    s.set_page(page.into());
+                    s.set_status("".into());
+                });
+            }
+            Nav::Detail(kind, id) => spawn(open_card(self.clone(), kind, id, record)),
+        }
+    }
+
+    /// Nueva pantalla: la anterior queda para la flecha de atras.
+    fn record_nav(&self, nav: Nav) {
+        {
+            let mut st = self.state.borrow_mut();
+            if st.nav == nav {
+                return;
+            }
+            let old = std::mem::replace(&mut st.nav, nav);
+            st.back.push(old);
+            if st.back.len() > 50 {
+                st.back.remove(0);
+            }
+            st.forward.clear();
+        }
+        self.push_nav_ui();
+    }
+
+    fn history_step(self: &Rc<Self>, back: bool) {
+        let target = {
+            let mut st = self.state.borrow_mut();
+            let Some(t) = (if back { st.back.pop() } else { st.forward.pop() }) else { return };
+            let cur = std::mem::replace(&mut st.nav, t.clone());
+            if back {
+                st.forward.push(cur);
+            } else {
+                st.back.push(cur);
+            }
+            t
+        };
+        self.push_nav_ui();
+        self.go(target, false);
+    }
+
+    fn push_nav_ui(&self) {
+        let (b, f) = {
+            let st = self.state.borrow();
+            (!st.back.is_empty(), !st.forward.is_empty())
+        };
+        self.ui.state(move |s| {
+            s.set_can_back(b);
+            s.set_can_forward(f);
+        });
+    }
+
+    /// Busqueda: al escribir se espera a que se deje de teclear; las respuestas viejas se
+    /// descartan (`search_gen`).
+    fn start_search(self: &Rc<Self>, q: String, typed: bool) {
+        let generation = {
+            let mut st = self.state.borrow_mut();
+            st.search_gen += 1;
+            st.search_gen
+        };
+        let q = q.trim().to_string();
+        if q.chars().count() < if typed { 2 } else { 1 } {
+            return;
+        }
+        let b = self.clone();
+        spawn(async move {
+            if typed {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                if b.state.borrow().search_gen != generation {
+                    return;
+                }
+            }
+            search(b, q, generation).await;
+        });
     }
 
     // ---------- ajustes ----------
@@ -471,9 +628,11 @@ impl Backend {
             return;
         }
         let Some(t) = tracks.get(i).cloned() else { return };
-        // Como YouTube Music: al tocar una cancion suelta se arma su "radio".
         self.set_queue(vec![t.clone()], 0);
-        spawn(extend_with_radio(self.clone(), t, true));
+        // Como YouTube Music: al tocar una cancion suelta se arma su "radio" (si esta activado).
+        if self.cfg().autoplay_radio {
+            spawn(extend_with_radio(self.clone(), t, true));
+        }
     }
 
     fn set_queue(self: &Rc<Self>, queue: Vec<Track>, start: usize) {
@@ -482,6 +641,7 @@ impl Backend {
             st.queue = queue;
             st.shuffle = false;
             st.queue_gen += 1;
+            st.added.clear();
         }
         self.ui.state(|s| s.set_shuffle(false));
         self.clear_prefetch();
@@ -494,6 +654,31 @@ impl Backend {
         self.state.borrow_mut().lists.insert(ListKind::Queue, queue.clone());
         self.show_tracks(ListKind::Queue, queue, current);
         self.jam_host_queue();
+    }
+
+    /// Agrega una cancion para que suene despues de la actual (y despues de las que ya se
+    /// agregaron asi). Devuelve donde quedo y si hay que tocarla ya: si la cola estaba
+    /// vacia o, con `play_if_idle` (Jam), si no esta sonando nada.
+    pub(super) fn insert_next(&self, track: Track, play_if_idle: bool) -> (usize, bool) {
+        let mut st = self.state.borrow_mut();
+        let was_empty = st.index.is_none() || st.queue.is_empty();
+        let len = st.queue.len();
+        let mut at = st.index.map(|i| i + 1).unwrap_or(len).min(len);
+        while at < st.queue.len() && st.added.contains(&st.queue[at].id) {
+            at += 1;
+        }
+        st.added.insert(track.id.clone());
+        st.queue.insert(at, track);
+        let idle = !self.engine.has_track() && !st.buffering;
+        (at, was_empty || (play_if_idle && idle))
+    }
+
+    /// Seek; si el audio todavia se esta bajando se hace en cuanto termine (ver ticker).
+    fn seek_to(&self, secs: f64) {
+        let done = self.engine.seek(secs);
+        let mut st = self.state.borrow_mut();
+        st.pending_seek = (!done).then_some(secs);
+        st.lyrics_idx = -2;
     }
 
     fn clear_prefetch(&self) {
@@ -512,6 +697,9 @@ impl Backend {
             st.index = Some(i);
             st.play_seq += 1;
             st.buffering = true;
+            st.pending_seek = None;
+            st.jam_ready = false;
+            st.added.remove(&t.id);
             (t, st.play_seq)
         };
         self.jam_host_hold();
@@ -558,7 +746,11 @@ impl Backend {
         });
         self.ui.mark_current(Some(t.id.clone()));
         let tt = t.clone();
-        self.ui.run(move |_| desktop::set_now_playing(Some(&tt), true));
+        self.ui.run(move |_| {
+            desktop::set_now_playing(Some(&tt), true);
+            // El panel de Windows cambia de inmediato (no hasta que termine de cargar).
+            desktop::smtc_metadata(&tt);
+        });
         // Portada grande
         if let Some(url) = t.thumb.clone() {
             let b = self.clone();
@@ -586,7 +778,7 @@ impl Backend {
             // Repetir una: se reusa el audio en memoria.
             let data = self.state.borrow().current_data.clone();
             if let Some(data) = data {
-                if self.engine.load(data, false).is_ok() {
+                if self.engine.load(&data, false).is_ok() {
                     self.state.borrow_mut().listened = 0.0;
                     self.state.borrow_mut().scrobbled = false;
                     // Los invitados ya tienen el audio: solo vuelven al principio.
@@ -789,21 +981,78 @@ impl Backend {
             s.set_lyrics_status("".into());
         });
         self.push_queue();
+        // Se va bajando la cancion guardada, para que el primer Play sea inmediato.
+        let b = self.clone();
+        spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if b.engine.has_track() || b.state.borrow().index != Some(i) {
+                return;
+            }
+            let low = b.cfg().quality == 1;
+            if let Ok(g) = fetch_audio(&b, &t.id, low).await {
+                let mut st = b.state.borrow_mut();
+                if st.prefetch.is_none() && st.index == Some(i) {
+                    st.prefetch = Some((t.id.clone(), g));
+                }
+            }
+        });
     }
 }
 
 // ---------- tareas asincronas ----------
 
-async fn fetch_audio(b: &Backend, id: &str, low: bool) -> Result<Arc<[u8]>, String> {
+/// Resuelve con yt-dlp y empieza a descargar; vuelve con el primer pedazo.
+async fn fetch_audio(b: &Backend, id: &str, low: bool) -> Result<Arc<Growing>, String> {
     let http = &b.http;
     let ui = b.ui.clone();
     stream::ensure_tools(http, move |m| ui.status(m)).await?;
-    let vid = id.to_string();
-    let resolved = tokio::task::spawn_blocking(move || stream::resolve(&vid, low))
-        .await
-        .map_err(|e| e.to_string())??;
-    let data = stream::download(http, &resolved).await?;
-    Ok(Arc::from(data))
+    let resolve = |cookies: Option<PathBuf>| {
+        let vid = id.to_string();
+        async move {
+            tokio::task::spawn_blocking(move || stream::resolve(&vid, low, cookies.as_deref()))
+                .await
+                .map_err(|e| e.to_string())?
+        }
+    };
+    let resolved = match resolve(None).await {
+        Ok(r) => r,
+        // YouTube pide confirmar que no eres un robot (pasa al saltar muchas canciones
+        // seguidas desde la misma IP): con la sesion iniciada se reintenta con tus cookies.
+        Err(e) if stream::is_bot_check(&e) => {
+            log::warn!("yt-dlp pidió verificación: {e}");
+            let Some(header) = b.rp.user_auth_cookie_header() else {
+                return Err("YouTube pidió confirmar que no eres un robot. Inicia sesión en Ajustes → Cuenta \
+                    (una sola vez) y no volverá a pasar; o espera unos minutos."
+                    .into());
+            };
+            let file = b.dir.join("yt-dlp-cookies.txt");
+            stream::write_cookie_file(&header, &file)?;
+            let r = resolve(Some(file.clone())).await;
+            let _ = std::fs::remove_file(&file);
+            r.map_err(|e| {
+                if stream::is_bot_check(&e) {
+                    "YouTube sigue pidiendo confirmar que no eres un robot. Espera unos minutos.".to_string()
+                } else {
+                    e
+                }
+            })?
+        }
+        Err(e) => return Err(e),
+    };
+    match stream::start_download(http, &resolved).await {
+        Ok(g) => Ok(g),
+        // YouTube a veces rechaza una URL recien resuelta (403): se pide otra una vez.
+        Err(e) if e.contains("HTTP 403") => {
+            log::info!("{id}: 403, se vuelve a resolver");
+            stream::forget(id);
+            let again = resolve(None).await?;
+            stream::start_download(http, &again).await.inspect_err(|_| stream::forget(id))
+        }
+        Err(e) => {
+            stream::forget(id);
+            Err(e)
+        }
+    }
 }
 
 async fn play_failed(b: &B, track: &Track, seq: u64, e: String) {
@@ -816,7 +1065,8 @@ async fn play_failed(b: &B, track: &Track, seq: u64, e: String) {
         st.errors_in_row
     };
     b.ui.state(|s| s.set_buffering(false));
-    if errors < 3 {
+    // Si YouTube pide verificar, saltar a la siguiente solo lo empeora.
+    if errors < 3 && !e.contains("robot") {
         tokio::time::sleep(Duration::from_secs(2)).await;
         if b.state.borrow().play_seq == seq {
             b.next(true);
@@ -826,6 +1076,21 @@ async fn play_failed(b: &B, track: &Track, seq: u64, e: String) {
 
 async fn load_and_play(b: B, track: Track, seq: u64, autoplay: bool) {
     let restore = b.state.borrow_mut().restore_position.take().filter(|p| *p > 1.0);
+    // Saltando canciones muy rapido: se espera un instante antes de correr yt-dlp, para
+    // no resolver cada cancion por la que se pasa (YouTube lo toma como un robot).
+    let quick = {
+        let mut st = b.state.borrow_mut();
+        let quick = st.last_play_at.elapsed() < Duration::from_millis(900);
+        st.last_play_at = Instant::now();
+        quick
+    };
+    let prefetched = b.state.borrow().prefetch.as_ref().is_some_and(|p| p.0 == track.id);
+    if quick && !prefetched {
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        if b.state.borrow().play_seq != seq {
+            return;
+        }
+    }
     let pre = {
         let mut st = b.state.borrow_mut();
         match st.prefetch.take() {
@@ -848,14 +1113,24 @@ async fn load_and_play(b: B, track: Track, seq: u64, autoplay: bool) {
         Ok(d) => d,
         Err(e) => return play_failed(&b, &track, seq, e).await,
     };
-    if let Err(e) = b.engine.load(data.clone(), !autoplay) {
+    // Para retomar donde se quedo hace falta poder hacer seek: se espera la descarga.
+    if restore.is_some() {
+        let r = data.wait_done().await;
+        if b.state.borrow().play_seq != seq {
+            return;
+        }
+        if let Err(e) = r {
+            return play_failed(&b, &track, seq, e).await;
+        }
+    }
+    if let Err(e) = b.engine.load(&data, !autoplay) {
         b.ui.status(e);
         return;
     }
     if let Some(pos) = restore {
         b.engine.seek(pos);
     }
-    b.jam_host_track(&track, Some(data.clone()));
+    b.jam_share_when_ready(&track, &data, seq);
     {
         let mut st = b.state.borrow_mut();
         st.current_data = Some(data);
@@ -1026,10 +1301,8 @@ async fn load_home(b: B) {
     b.ui.loading(false);
 }
 
-async fn search(b: B, q: String) {
-    if q.trim().is_empty() {
-        return;
-    }
+/// `generation`: si mientras tanto se escribio otra cosa, el resultado se descarta.
+async fn search(b: B, q: String, generation: u64) {
     b.ui.loading(true);
     let query = b.query();
     let q = q.trim();
@@ -1041,6 +1314,9 @@ async fn search(b: B, q: String) {
         query.music_search_albums(q),
         query.music_search_playlists(q, false)
     );
+    if b.state.borrow().search_gen != generation {
+        return; // la busqueda siguiente apaga el "Cargando…"
+    }
     match main_res {
         Ok(res) => {
             let (fallback_tracks, mut cards) = model::split_items(res.items.items);
@@ -1064,8 +1340,11 @@ async fn search(b: B, q: String) {
     b.ui.loading(false);
 }
 
-async fn open_card(b: B, kind: CardKind, id: String) {
+/// `record`: es una pantalla nueva (queda en el historial); false al ir atras/adelante.
+async fn open_card(b: B, kind: CardKind, id: String, record: bool) {
     b.ui.loading(true);
+    // Nombre de la tarjeta que se toco: YouTube ya no siempre manda el de las listas.
+    let card_title = b.state.borrow().cards.values().flatten().find(|c| c.id == id).map(|c| c.title.clone());
     let q = b.query();
     let result: Result<(String, String, Option<String>, Vec<Track>, Vec<Card>), String> = match kind {
         CardKind::Album => q.music_album(&id).await.map_err(|e| e.to_string()).map(|a| {
@@ -1104,7 +1383,8 @@ async fn open_card(b: B, kind: CardKind, id: String) {
                 let cover = model::pick_thumb(&p.thumbnail, 60);
                 let tracks = p.tracks.items.into_iter().map(model::from_track).collect();
                 let cards = p.related_playlists.items.into_iter().map(model::from_playlist).collect();
-                Ok((p.name, sub, cover, tracks, cards))
+                let name = if p.name.is_empty() { card_title.clone().unwrap_or_else(|| "Lista".into()) } else { p.name };
+                Ok((name, sub, cover, tracks, cards))
             }
             Err(e) => Err(e.to_string()),
         },
@@ -1129,6 +1409,9 @@ async fn open_card(b: B, kind: CardKind, id: String) {
             return;
         }
     };
+    if record {
+        b.record_nav(Nav::Detail(kind, id.clone()));
+    }
     b.state.borrow_mut().detail_tracks_id = Some((kind, id));
     b.set_list(ListKind::Detail, tracks);
     b.set_cards(CardListKind::Detail, cards);
@@ -1154,14 +1437,34 @@ async fn load_library(b: B) {
         return;
     }
     let q = b.query().authenticated();
-    match q.music_liked_tracks().await {
+    let liked = match q.music_liked_tracks().await {
         Ok(mut p) => {
             let _ = p.tracks.extend_limit(&q, 500).await;
-            b.set_list(ListKind::Library, p.tracks.items.into_iter().map(model::from_track).collect());
+            Ok(p.tracks.items)
         }
+        // Si la lista «Me gusta» (LM) no se puede leer, las canciones guardadas incluyen
+        // los Me gusta (y las de albumes guardados).
         Err(e) => {
-            log::warn!("biblioteca: {e}");
-            b.ui.status(format!("No se pudo cargar tu biblioteca: {e}"));
+            log::warn!("me gusta: {e}");
+            match q.music_saved_tracks().await {
+                Ok(mut p) => {
+                    let _ = p.extend_limit(&q, 500).await;
+                    Ok(p.items)
+                }
+                Err(e2) => Err((e, e2)),
+            }
+        }
+    };
+    match liked {
+        Ok(items) => b.set_list(ListKind::Library, items.into_iter().map(model::from_track).collect()),
+        Err((e, e2)) => {
+            log::warn!("biblioteca: {e} / {e2}");
+            let msg = if matches!(e2, rustypipe::error::Error::Auth(_)) || e.to_string().contains("sectionListRenderer") {
+                "Tu sesión de YouTube venció. Vuelve a iniciar sesión en Ajustes → Cuenta.".to_string()
+            } else {
+                format!("No se pudo cargar tu biblioteca: {e}")
+            };
+            b.ui.status(msg);
             return;
         }
     }
@@ -1255,6 +1558,64 @@ async fn lastfm_connect(b: B) {
     b.ui.run(move |ui| ui.global::<Cfg>().set_lastfm_status(msg.into()));
 }
 
+/// Revisa si hay version nueva al abrir y cada 6 horas (el boton UpDate se pone rojo).
+async fn update_loop(b: B) {
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    loop {
+        let _ = check_update(&b).await;
+        tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+    }
+}
+
+async fn check_update(b: &B) -> Result<bool, String> {
+    let rel = crate::update::latest(&b.http).await.inspect_err(|e| log::info!("actualizaciones: {e}"))?;
+    let newer = crate::update::is_newer(&rel.version, crate::update::CURRENT);
+    let version = rel.version.clone();
+    b.state.borrow_mut().update = newer.then_some(rel);
+    b.ui.state(move |s| {
+        s.set_update_available(newer);
+        s.set_update_tip(
+            if newer { format!("Hay una versión nueva ({version}): clic para actualizar") } else { format!("Versión {}", crate::update::CURRENT) }
+                .into(),
+        );
+    });
+    Ok(newer)
+}
+
+async fn update_click(b: B) {
+    if b.state.borrow().updating {
+        return;
+    }
+    let rel = b.state.borrow().update.clone();
+    let Some(rel) = rel else {
+        // En blanco: se revisa en el momento.
+        b.ui.status("Buscando actualizaciones…");
+        match check_update(&b).await {
+            Ok(true) => b.ui.status("Hay una versión nueva: vuelve a pulsar UpDate para instalarla."),
+            Ok(false) => b.ui.status(format!("Ya tienes la última versión ({}).", crate::update::CURRENT)),
+            Err(e) => b.ui.status(format!("No se pudo revisar si hay actualizaciones: {e}")),
+        }
+        return;
+    };
+    b.state.borrow_mut().updating = true;
+    b.ui.status(format!("Descargando la versión {}…", rel.version));
+    match crate::update::install(&b.http, &rel).await {
+        Ok(()) => {
+            log::info!("actualizando a {}", rel.version);
+            b.ui.status("Instalando… la app se vuelve a abrir sola en unos segundos.");
+            b.save_session();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            b.ui.run(|_| {
+                let _ = slint::quit_event_loop();
+            });
+        }
+        Err(e) => {
+            b.state.borrow_mut().updating = false;
+            b.ui.status(format!("No se pudo actualizar: {e}"));
+        }
+    }
+}
+
 /// Cada 250 ms: posicion, fin de cancion, SponsorBlock, letra y scrobbling.
 async fn ticker(b: B) {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
@@ -1272,6 +1633,13 @@ async fn ticker(b: B) {
         }
         if !b.engine.has_track() || b.state.borrow().buffering {
             continue;
+        }
+        // Seek que se pidio mientras el audio bajaba: ya se puede.
+        let pending = b.state.borrow().pending_seek;
+        if let Some(p) = pending.filter(|_| b.engine.can_seek()) {
+            b.state.borrow_mut().pending_seek = None;
+            b.engine.seek(p);
+            b.on_play_state();
         }
         if !guest && save_counter % 8 == 0 {
             // Latido del Jam cada 2 s (por si a un invitado se le paso algun cambio).
@@ -1294,7 +1662,7 @@ async fn ticker(b: B) {
         // SponsorBlock
         let skip_to = b.state.borrow().segments.iter().find(|s| pos >= s[0] && pos < s[1] - 0.5).map(|s| s[1]);
         if let Some(to) = skip_to {
-            b.engine.seek(to);
+            b.seek_to(to);
             b.jam_host_state();
         }
 
@@ -1350,6 +1718,15 @@ async fn ticker(b: B) {
     }
 }
 
+/// Donde queda la cancion `cur` de la cola despues de mover la de `from` a `to`.
+fn moved_index(cur: usize, from: usize, to: usize) -> usize {
+    if cur == from {
+        return to;
+    }
+    let c = if from < cur { cur - 1 } else { cur };
+    if to <= c { c + 1 } else { c }
+}
+
 fn shuffle_vec<T>(v: &mut [T]) {
     // xorshift sencillo; no hace falta una libreria de numeros aleatorios.
     let mut x = (std::time::SystemTime::now()
@@ -1375,6 +1752,8 @@ pub fn push_cfg_to_ui(ui: &crate::AppWindow, cfg: &Config) {
     c.set_sponsorblock(cfg.sponsorblock);
     c.set_discord(cfg.discord);
     c.set_lastfm(cfg.lastfm.enabled);
+    c.set_eq_enabled(cfg.eq_enabled);
+    c.set_eq(slint::ModelRc::from(Rc::new(slint::VecModel::from(cfg.eq.to_vec()))));
     c.set_lastfm_status(
         cfg.lastfm.user.as_ref().map(|u| format!("Conectado como {u}")).unwrap_or_else(|| "Sin conectar".into()).into(),
     );
@@ -1383,12 +1762,11 @@ pub fn push_cfg_to_ui(ui: &crate::AppWindow, cfg: &Config) {
     s.set_volume(cfg.volume);
     s.set_logged_in(cfg.logged_in);
     s.set_jam_name(cfg.jam_name.clone().into());
-    s.set_jam_port(cfg.jam_port as i32);
-    s.set_jam_join_address(cfg.jam_last_address.clone().into());
+    s.set_jam_room(cfg.jam_room.clone().into());
 }
 
 /// Lo que se puede cambiar en la pantalla de ajustes. Las opciones avanzadas
-/// (ecualizador, atajos, API local, puertos...) solo se editan en config.json.
+/// (atajos, API local, puertos...) solo se editan en config.json.
 #[derive(Debug)]
 pub struct UiSettings {
     restore_session: bool,
@@ -1398,6 +1776,8 @@ pub struct UiSettings {
     sponsorblock: bool,
     discord: bool,
     lastfm: bool,
+    eq_enabled: bool,
+    eq: [f32; 10],
 }
 
 impl UiSettings {
@@ -1409,6 +1789,8 @@ impl UiSettings {
         cfg.sponsorblock = self.sponsorblock;
         cfg.discord = self.discord;
         cfg.lastfm.enabled = self.lastfm;
+        cfg.eq_enabled = self.eq_enabled;
+        cfg.eq = self.eq;
     }
 }
 
@@ -1423,6 +1805,11 @@ pub fn read_cfg_from_ui(ui: &crate::AppWindow) -> UiSettings {
         sponsorblock: c.get_sponsorblock(),
         discord: c.get_discord(),
         lastfm: c.get_lastfm(),
+        eq_enabled: c.get_eq_enabled(),
+        eq: {
+            let m = c.get_eq();
+            std::array::from_fn(|i| m.row_data(i).unwrap_or(0.0).clamp(-12.0, 12.0))
+        },
     }
 }
 
@@ -1439,3 +1826,19 @@ async fn remove_login_webview() {
     log::warn!("no se pudo borrar {}", dir.display());
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::moved_index;
+
+    #[test]
+    fn mover_en_la_cola_sigue_a_la_cancion_actual() {
+        // Cola [a b c d e], suena c (2).
+        assert_eq!(moved_index(2, 2, 0), 0); // se arrastra la actual
+        assert_eq!(moved_index(2, 0, 4), 1); // a pasa al final: c sube
+        assert_eq!(moved_index(2, 4, 0), 3); // e pasa al inicio: c baja
+        assert_eq!(moved_index(2, 3, 4), 2); // se mueve algo despues: no cambia
+        assert_eq!(moved_index(2, 0, 1), 2); // se mueve algo antes: no cambia
+        assert_eq!(moved_index(2, 4, 2), 3); // e queda justo antes de c
+    }
+}

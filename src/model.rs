@@ -179,3 +179,42 @@ mod tests {
         assert_eq!(resize_thumb("https://i.ytimg.com/vi/x/hq.jpg", 120), "https://i.ytimg.com/vi/x/hq.jpg");
     }
 }
+
+/// Comprobaciones contra YouTube Music con la sesion guardada del usuario (rustypipe
+/// parchada en vendor/). Necesita red: `cargo test -- --ignored youtube_real`
+#[cfg(test)]
+mod youtube_real {
+    #[test]
+    #[ignore]
+    fn youtube_real_listas_y_me_gusta() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let rp = rustypipe::client::RustyPipe::builder().storage_dir(crate::config::data_dir()).build().unwrap();
+            let q = rp.query();
+            // Listas de usuario (PL...): YouTube ya no manda su encabezado.
+            for id in ["PLIlZe8cHMkHClGxhYOFqA1E38BJe7VHXq", "PL4fGSI1pDJn6J_wL2E_YUjJ8GLv_UBUl4"] {
+                let p = q.music_playlist(id).await.unwrap();
+                println!("{id}: «{}» {} canciones", p.name, p.tracks.items.len());
+                assert!(!p.tracks.items.is_empty());
+            }
+            if rp.user_auth_cookie_header().is_none() {
+                println!("sin sesión guardada: se omiten Me gusta");
+                return;
+            }
+            let qa = q.clone().authenticated();
+            let mut liked = qa.music_liked_tracks().await.unwrap();
+            let _ = liked.tracks.extend_limit(&qa, 500).await;
+            println!("Me gusta: {} canciones", liked.tracks.items.len());
+            let lm = qa.music_playlist("LM").await.unwrap();
+            println!("tarjeta LM: {} canciones", lm.tracks.items.len());
+            let saved = qa.music_saved_playlists().await.unwrap();
+            println!("listas guardadas: {}", saved.items.len());
+            for p in saved.items.iter().take(8) {
+                match qa.music_playlist(&p.id).await {
+                    Ok(x) => println!("  OK {} «{}» {}", p.id, p.name, x.tracks.items.len()),
+                    Err(e) => panic!("  {} «{}»: {e}", p.id, p.name),
+                }
+            }
+        });
+    }
+}

@@ -8,7 +8,7 @@ using a fraction of the memory.
 |---|---|---|
 | Pear Desktop (Electron) | ~480–615 MB | ~700–835 MB |
 | Previous WebView2 version (`version-webview/`) | ~290 MB | — |
-| **This app, while playing** | **~21–25 MB** | **~42–55 MB** |
+| **This app, while playing** | **~25–35 MB** | **~45–60 MB** |
 
 ## Download
 
@@ -28,20 +28,33 @@ Grab `YoutubeInRustWeb-Setup.exe` from the [latest release](https://github.com/B
 - **YouTube audio**: the stream URL is resolved by [yt-dlp](https://github.com/yt-dlp/yt-dlp)
   (rustypipe can no longer decipher YouTube's current player). yt-dlp runs for ~2 s per song and exits
   (the unpacked `yt-dlp_win.zip` build is used: the single-file .exe re-extracts itself on every run, +2.5 s).
-  Downloading (AAC/M4A into memory), decoding (symphonia) and playback (rodio) are pure Rust.
-  The next song is preloaded while the current one plays.
+  Resolved URLs are cached (they last ~6 h), so going back to a song doesn't run yt-dlp again, and
+  yt-dlp is warmed up at launch (its first run after boot is slow).
+  Downloading (AAC/M4A into memory, in chunks), decoding (symphonia) and playback (rodio) are pure Rust.
+  **Playback starts with the first chunk** (~0.4 MB, usually < 0.2 s) while the rest keeps downloading;
+  the first seek reopens the song once it is complete (YouTube's fragmented M4A can't be opened
+  seekable until then). The next song is preloaded while the current one plays.
+- **"Sign in to confirm you're not a bot"**: skipping many songs quickly makes YouTube ask for this.
+  The app waits a moment before resolving when you skip fast, and if YouTube still asks, it retries
+  once with your YouTube session (if you're signed in) instead of jumping to the next song.
 - **Self-contained**: on first launch the app downloads yt-dlp into `%APPDATA%\YoutubeInRustWeb\bin\yt-dlp`
   and updates it every 3 days. yt-dlp needs a JavaScript runtime: Node.js is used if installed,
   otherwise deno is downloaded into the same folder.
+- **One-click updates**: the **UpDate** button (top right) turns red when a newer release is on
+  GitHub. Clicking it downloads the installer, runs it silently and reopens the app.
+
 ## Features
 
-- Home (country charts), search (songs / albums, artists, playlists), artist,
-  album and playlist pages, queue with automatic radio, shuffle and repeat.
+- Home (country charts), search as you type (songs / albums, artists, playlists), artist,
+  album and playlist pages, back / forward arrows between screens.
+- Queue: *+* adds a song right after the current one (after any songs you added before it);
+  press and drag a song to reorder it; automatic radio ("similar songs", can be turned off),
+  shuffle and repeat.
 - Synced lyrics (LRCLIB) or YouTube Music's official lyrics.
 - Windows media overlay and hardware media keys, tray icon, global hotkeys
   (`Ctrl+Shift+Space`, `Ctrl+Shift+←/→`, `Ctrl+Shift+Y`).
-- 10-band equalizer and "skip leading silence" (custom DSP in `src/audio.rs`), exponential volume,
-  mouse-wheel volume, high/low audio quality.
+- 10-band equalizer with presets (Settings), "skip leading silence" (custom DSP in `src/audio.rs`),
+  exponential volume, mouse-wheel volume, high/low audio quality.
 - SponsorBlock (non-music segments in music videos), Discord Rich Presence, Last.fm and ListenBrainz
   scrobbling, notifications, local HTTP API compatible with Pear (`/api/v1/...`, 127.0.0.1 only).
 - Remembers the queue and position on exit (never autoplays on launch).
@@ -55,13 +68,16 @@ Grab `YoutubeInRustWeb-Setup.exe` from the [latest release](https://github.com/B
 
 - **YouTube Music**: Settings → *Iniciar sesión con Google* opens a Google window (a separate
   WebView2 process that closes by itself once you are signed in; its data is deleted afterwards).
-  Without an account everything works except the library.
+  Before copying the cookies the window moves to a page without JavaScript, so YouTube doesn't
+  rotate (and invalidate) them right away. Without an account everything works except the library
+  (liked songs, saved playlists and albums); signed in, every request is authenticated, so private
+  playlists and the "Liked Music" card work too.
 
 ### Settings
 
-The Settings page only shows simple options and saves each change immediately. Advanced options
-(equalizer, exponential volume, skip leading silence, country for the charts, global hotkeys,
-ListenBrainz, local HTTP API and its port, Jam port) still work but are only edited in
+The Settings page only shows simple options (and the equalizer) and saves each change immediately.
+Advanced options (exponential volume, skip leading silence, country for the charts, global hotkeys,
+ListenBrainz, local HTTP API and its port) still work but are only edited in
 `%APPDATA%\YoutubeInRustWeb\config.json` (close the app first).
 
 ### Jam (listen together)
@@ -69,8 +85,8 @@ ListenBrainz, local HTTP API and its port, Jam port) still work but are only edi
 YouTube Music has no Jam, and the YouTube Data API v3 isn't built for real-time sync (and its
 quotas are tight), so the app orchestrates the session itself. YouTube is never asked to sync anything:
 
-- The **host** already downloads each song completely into memory, so it sends those same bytes
-  to the guests over TCP. YouTube sees one download per song no matter how many people join.
+- The **host** already downloads each song into memory, so once it is complete it sends those same
+  bytes to the guests. YouTube sees one download per song no matter how many people join.
   Only audio is shared, never video.
 - The host tells the guests which position to play at which instant *of the host's clock*. Each
   guest estimates the host's clock the way NTP does (ping/pong, keeping the lowest-delay sample) and
@@ -79,16 +95,17 @@ quotas are tight), so the app orchestrates the session itself. YouTube is never 
   play/pause, skip and seek; those requests are sent to the host.
 - While a Jam is running, "skip leading silence" is turned off, because it would shift the position.
 
-How to use it: open **Jam** in the sidebar. The host clicks *Crear Jam* and shares the address
-(`IP:port`, default port `26541`) and the 6-character code. Guests type both in and click *Unirse*.
-It works on the same network or over a VPN such as Tailscale or ZeroTier. To invite people over the
-internet, open the port on the host's router. Windows may ask for a firewall permission the first time.
+How to use it: open **Jam** in the sidebar. The host picks a **Jam name and a password**, clicks
+*Crear Jam* and tells them to the others; guests type the same two and click *Unirme*. It works over
+the internet from different places: no IP addresses, no router ports, no firewall prompts.
 
-Transport is plain TCP with a small length-prefixed framing (`src/jam/protocol.rs`): both ends are
-this app, so WebSocket adds nothing. WebRTC (NAT traversal) would cost many dependencies and memory.
-The protocol doesn't depend on the transport, so a WebRTC data channel can be added later.
-Audio chunks are written straight from the host's buffer and read straight into the guest's buffer,
-with no intermediate copies. Up to 8 guests.
+Transport is [iroh](https://github.com/n0-computer/iroh) (QUIC). The host's key is derived from
+the Jam name + password (SHA-256), so a guest computes the same endpoint id and finds the host through
+iroh's public directory (n0's DNS/pkarr). iroh tries a direct connection (hole punching) and falls
+back to its public relays; everything is end-to-end encrypted. Opening a Jam that already exists
+(same name and password) is refused. The framing (`src/jam/protocol.rs`) runs over one bidirectional
+QUIC stream; audio chunks are written straight from the host's buffer and read straight into the
+guest's buffer, with no intermediate copies. Up to 8 guests.
 
 ## Project layout
 
@@ -97,16 +114,25 @@ ui/app.slint              user interface
 src/main.rs               window, callbacks, single instance
 src/backend.rs            queue, playback, radio, search, lyrics, accounts
 src/backend/jam_link.rs   Jam <-> player glue (host broadcasts, guest drift correction)
-src/jam/                  Jam: protocol, clock sync (NTP-style), host, guest
+src/jam/                  Jam: protocol, clock sync (NTP-style), host, guest, iroh transport (net.rs)
 src/audio.rs              audio engine + equalizer + silence skipping
-src/stream.rs             yt-dlp (auto-download/update) + chunked download
+src/stream.rs             yt-dlp (auto-download/update, URL cache) + streaming chunked download
+src/update.rs             UpDate button: checks GitHub releases, runs the installer silently
 src/images.rs             small cover art with a bounded cache
 src/desktop.rs            tray, global hotkeys, media overlay (SMTC)
 src/login.rs              Google sign-in window (`--login` process)
 src/integrations/         discord, scrobbler, lyrics (LRCLIB), sponsorblock, local API
 installer/                Inno Setup script
+vendor/                   two crates with a small patch each (search "YoutubeInRustWeb" in them):
+                            rustypipe: user playlists without header (YouTube 2026-10), no panic
+                            i-slint-backend-winit: always repaint/present the whole window
+scripts/grafo/            dev only: code graph + semantic search (see CLAUDE.md)
 version-webview/          previous version (Tauri + WebView2, ~290 MB)
 ```
+
+Why the Slint patch: with partial repaints, when Windows invalidated the window (Tab focus changes,
+another window on top) and Slint saw no change, nothing was copied to the screen, so stale pixels
+(an old song title, half-drawn rows) stayed until the window was minimized and restored.
 
 ## Building
 
@@ -115,6 +141,7 @@ Requirements: Rust (MSVC toolchain) and the WebView2 runtime (ships with Windows
 ```powershell
 cargo build --release
 cargo test
+cargo test -- --ignored   # needs network: Jam over the internet, real streaming, playlists/liked songs
 ```
 
 The C runtime is linked statically (`.cargo/config.toml`), so the `.exe` does not need the

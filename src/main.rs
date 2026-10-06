@@ -16,10 +16,11 @@ mod login;
 mod model;
 mod stream;
 mod ui;
+mod update;
 mod util;
 
 use backend::Cmd;
-use slint::ComponentHandle;
+use slint::{ComponentHandle, Model};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -134,8 +135,6 @@ fn main() {
     let quit_tx = tx.clone();
     desktop::init(tx.clone(), hwnd, toggle, move || quit(&quit_tx));
     desktop::apply_shortcuts(&cfg);
-    #[cfg(windows)]
-    desktop::watch_repaint(ui.as_weak(), hwnd);
 
     slint::run_event_loop_until_quit().expect("error en el bucle de eventos");
     // Hay hilos que nunca terminan (salida de audio, backend, API local): se termina el
@@ -171,7 +170,15 @@ fn wire_callbacks(ui: &AppWindow, tx: &tokio::sync::mpsc::UnboundedSender<Cmd>) 
     let t = tx.clone();
     s.on_navigate(move |p| send!(t, Cmd::Navigate(p.to_string())));
     let t = tx.clone();
+    s.on_back(move || send!(t, Cmd::Back));
+    let t = tx.clone();
+    s.on_forward(move || send!(t, Cmd::Forward));
+    let t = tx.clone();
+    s.on_update_click(move || send!(t, Cmd::UpdateClick));
+    let t = tx.clone();
     s.on_search(move |q| send!(t, Cmd::Search(q.to_string())));
+    let t = tx.clone();
+    s.on_search_typed(move |q| send!(t, Cmd::SearchTyped(q.to_string())));
     let t = tx.clone();
     s.on_play_track(move |l, i| send!(t, Cmd::PlayTrack(l.to_string(), i.max(0) as usize)));
     let t = tx.clone();
@@ -201,11 +208,32 @@ fn wire_callbacks(ui: &AppWindow, tx: &tokio::sync::mpsc::UnboundedSender<Cmd>) 
     let t = tx.clone();
     s.on_queue_remove(move |i| send!(t, Cmd::QueueRemove(i.max(0) as usize)));
     let t = tx.clone();
+    s.on_queue_move(move |from, to| send!(t, Cmd::QueueMove(from.max(0) as usize, to.max(0) as usize)));
+    let t = tx.clone();
     s.on_queue_clear(move || send!(t, Cmd::QueueClear));
     let t = tx.clone();
     let weak = ui.as_weak();
     s.on_save_settings(move || {
         if let Some(u) = weak.upgrade() {
+            send!(t, Cmd::SaveSettings(backend::read_cfg_from_ui(&u)));
+        }
+    });
+    // Ecualizador: mientras se arrastra solo se escucha; al soltar se guarda (save-settings).
+    let t = tx.clone();
+    let weak = ui.as_weak();
+    s.on_eq_changed(move |i, v| {
+        if let Some(u) = weak.upgrade() {
+            let m = u.global::<Cfg>().get_eq();
+            m.set_row_data(i.max(0) as usize, v.clamp(-12.0, 12.0));
+            send!(t, Cmd::PreviewSettings(backend::read_cfg_from_ui(&u)));
+        }
+    });
+    let t = tx.clone();
+    let weak = ui.as_weak();
+    s.on_eq_preset(move |p| {
+        if let Some(u) = weak.upgrade() {
+            let gains = audio::EQ_PRESETS[(p.max(0) as usize).min(audio::EQ_PRESETS.len() - 1)];
+            u.global::<Cfg>().set_eq(slint::ModelRc::from(std::rc::Rc::new(slint::VecModel::from(gains.to_vec()))));
             send!(t, Cmd::SaveSettings(backend::read_cfg_from_ui(&u)));
         }
     });
@@ -216,9 +244,9 @@ fn wire_callbacks(ui: &AppWindow, tx: &tokio::sync::mpsc::UnboundedSender<Cmd>) 
     let t = tx.clone();
     s.on_lastfm_connect(move || send!(t, Cmd::LastfmConnect));
     let t = tx.clone();
-    s.on_jam_host(move |name, port| send!(t, Cmd::JamHost(name.to_string(), port.clamp(1024, 65535) as u16)));
+    s.on_jam_host(move |name, room, pass| send!(t, Cmd::JamHost(name.to_string(), room.to_string(), pass.to_string())));
     let t = tx.clone();
-    s.on_jam_join(move |name, addr, code| send!(t, Cmd::JamJoin(name.to_string(), addr.to_string(), code.to_string())));
+    s.on_jam_join(move |name, room, pass| send!(t, Cmd::JamJoin(name.to_string(), room.to_string(), pass.to_string())));
     let t = tx.clone();
     s.on_jam_leave(move || send!(t, Cmd::JamLeave));
 }

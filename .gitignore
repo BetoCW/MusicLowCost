@@ -11,3 +11,7 @@
 
 # Personal notes (not published)
 /NOTAS-PARA-MA*.md
+
+# Herramienta de grafo de codigo (solo desarrollo)
+node_modules/
+.codegraph/

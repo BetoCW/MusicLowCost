@@ -8,15 +8,17 @@
 //! su posicion si se desvia. YouTube ve una sola descarga por cancion, sin importar
 //! cuantas personas haya en el Jam. Solo audio: el video nunca se pide.
 //!
-//! Transporte: TCP directo con tramas propias (protocol.rs). Los dos extremos son esta
-//! app, asi que WebSocket no aporta nada, y WebRTC (para atravesar NAT) cuesta muchas
-//! dependencias y memoria; el protocolo no depende del transporte por si se agrega despues.
-//! Funciona en la misma red o por una VPN tipo Tailscale/ZeroTier; por internet hay que
-//! abrir el puerto en el router del anfitrion.
+//! Transporte: iroh (QUIC) por internet, sin abrir puertos ni pasar direcciones IP. La sala
+//! se identifica con nombre + contraseña: de ahi sale (con SHA-256) la llave del anfitrion,
+//! asi que el invitado calcula el mismo id y lo busca en el directorio publico de iroh
+//! (DNS/pkarr de n0). iroh intenta la conexion directa (hole punching) y si no puede usa sus
+//! relays publicos. Todo va cifrado de punta a punta con esa llave. Las tramas (protocol.rs)
+//! viajan por un stream bidireccional de QUIC (ver net.rs).
 
 mod clock;
 mod guest;
 mod host;
+mod net;
 mod protocol;
 
 pub use clock::Clock;
@@ -29,7 +31,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-pub const DEFAULT_PORT: u16 = 26541;
+/// Protocolo de la conexion (ALPN): solo se aceptan conexiones de esta app.
+pub const ALPN: &[u8] = b"youtubeinrustweb/jam/2";
 pub const MAX_GUESTS: usize = 8;
 
 /// Que tocar: `pos_ms` de la cancion `tag` en el instante `at` (reloj del anfitrion, us).
@@ -65,7 +68,7 @@ pub enum Event {
     Audio { tag: u32, data: Arc<[u8]> },
     State(PlayState),
     Queue(Vec<Track>),
-    /// Se cerro la conexion (invitado).
+    /// Se cerro la conexion (invitado) o no se pudo abrir la sala (anfitrion).
     Ended(String),
 }
 
@@ -90,32 +93,17 @@ pub fn next_id() -> u32 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Codigo de 6 caracteres para entrar (sin 0/O/1/I para dictarlo sin confusiones).
-/// No es criptografico: solo evita que cualquiera en la red se cuele al Jam.
-pub fn new_code() -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let mut x = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(1)
-        ^ ((std::process::id() as u64) << 32)
-        | 1;
-    (0..6)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            ALPHABET[(x % ALPHABET.len() as u64) as usize] as char
-        })
-        .collect()
-}
-
-/// IP de esta PC en la red local (para mostrarla al anfitrion). No manda ningun paquete:
-/// `connect` en UDP solo elige la interfaz de salida.
-pub fn local_ip() -> Option<std::net::IpAddr> {
-    let s = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    s.connect(("8.8.8.8", 80)).ok()?;
-    s.local_addr().ok().map(|a| a.ip())
+/// Llave del anfitrion de la sala `room` con contraseña `password` (el nombre no distingue
+/// mayusculas ni espacios de sobra; la contraseña si).
+pub fn room_key(room: &str, password: &str) -> iroh::SecretKey {
+    use sha2::{Digest, Sha256};
+    let room = room.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let mut h = Sha256::new();
+    h.update(b"YoutubeInRustWeb jam v2\n");
+    h.update(room.as_bytes());
+    h.update(b"\n");
+    h.update(password.as_bytes());
+    iroh::SecretKey::from_bytes(&h.finalize().into())
 }
 
 /// Nombre visible: sin saltos de linea y como mucho 32 caracteres.
@@ -162,23 +150,24 @@ mod tests {
         }
     }
 
-    /// Anfitrion e invitado reales por 127.0.0.1: entrada, audio completo, estado,
-    /// reloj, peticiones y cambio de cancion a mitad del envio.
+    /// Anfitrion e invitado reales por 127.0.0.1 (el protocolo no depende de iroh): entrada,
+    /// audio completo, estado, reloj, peticiones y cambio de cancion a mitad del envio.
     #[test]
     fn anfitrion_e_invitado_por_loopback() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         tokio::task::LocalSet::new().block_on(&rt, async {
             let (host_tx, mut host_rx) = unbounded_channel();
             let (guest_tx, mut guest_rx) = unbounded_channel();
-            let host = Host::start(0, "Ana", "ABC123".into(), host_tx, 1).unwrap();
-            let addr = format!("127.0.0.1:{}", host.port());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let host = Host::start_tcp(listener, "secreta", "Ana", host_tx, 1);
 
             // Audio de mas de un pedazo, con contenido reconocible.
             let audio: Arc<[u8]> = (0..200_000u32).map(|i| (i % 251) as u8).collect::<Vec<_>>().into();
             host.set_track(&track("aaaaaaaaaaa"), Some(audio.clone()));
             host.set_state(true, 12.0);
 
-            let guest = Guest::start(addr.clone(), "abc123".into(), "Beto".into(), guest_tx, 2);
+            let guest = Guest::start_tcp(addr.clone(), "secreta".into(), "Beto".into(), guest_tx, 2);
             let who = wait_for(&mut guest_rx, |e| if let Event::Joined(h) = e { Some(h) } else { None }).await;
             assert_eq!(who, "Ana");
             let shared = wait_for(&mut guest_rx, |e| if let Event::Track { shared, .. } = e { Some(shared) } else { None }).await;
@@ -212,11 +201,11 @@ mod tests {
             assert_eq!(tag, 2);
             assert_eq!(&*got, &*audio2);
 
-            // Codigo incorrecto: rechazado.
+            // Contraseña incorrecta: rechazado.
             let (bad_tx, mut bad_rx) = unbounded_channel();
-            let _bad = Guest::start(addr, "ZZZZZZ".into(), "X".into(), bad_tx, 3);
+            let _bad = Guest::start_tcp(addr, "Secreta".into(), "X".into(), bad_tx, 3);
             let reason = wait_for(&mut bad_rx, |e| if let Event::Ended(r) = e { Some(r) } else { None }).await;
-            assert_eq!(reason, "Código incorrecto.");
+            assert_eq!(reason, "Contraseña incorrecta.");
 
             // Al cerrar el anfitrion, el invitado se entera.
             drop(host);
@@ -225,11 +214,51 @@ mod tests {
         });
     }
 
+    /// Sala real por internet (iroh + directorio y relays de n0). Necesita red:
+    /// `cargo test -- --ignored jam_por_internet`
     #[test]
-    fn codigos_y_nombres() {
-        let c = new_code();
-        assert_eq!(c.len(), 6);
-        assert!(c.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit()));
+    #[ignore]
+    fn jam_por_internet() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, async {
+            let room = format!("prueba {}", crate::util::unix_now());
+            let (host_tx, mut host_rx) = unbounded_channel();
+            let (guest_tx, mut guest_rx) = unbounded_channel();
+            let host = Host::start(&room, "clave1", "Ana", host_tx, 1);
+            let t0 = std::time::Instant::now();
+            let deadline = Duration::from_secs(60);
+            // Abrir la sala tarda unos segundos (busca si ya existe y se publica).
+            loop {
+                match tokio::time::timeout(deadline, host_rx.recv()).await {
+                    Ok(Some(Cmd::Jam(_, Event::Status(s)))) if s.starts_with("Jam listo") => break,
+                    Ok(Some(Cmd::Jam(_, Event::Ended(e)))) => panic!("el anfitrión falló: {e}"),
+                    Ok(Some(_)) => {}
+                    other => panic!("sin respuesta del anfitrión: {other:?}"),
+                }
+            }
+            println!("sala lista en {:?}", t0.elapsed());
+            let audio: Arc<[u8]> = vec![3u8; 300_000].into();
+            host.set_track(&track("aaaaaaaaaaa"), Some(audio.clone()));
+            host.set_state(true, 1.0);
+
+            let t1 = std::time::Instant::now();
+            let _guest = Guest::start(room.to_uppercase(), "clave1".into(), "Beto".into(), guest_tx, 2);
+            let got = loop {
+                match tokio::time::timeout(deadline, guest_rx.recv()).await {
+                    Ok(Some(Cmd::Jam(_, Event::Joined(h)))) => println!("unido a {h} en {:?}", t1.elapsed()),
+                    Ok(Some(Cmd::Jam(_, Event::Audio { data, .. }))) => break data,
+                    Ok(Some(Cmd::Jam(_, Event::Ended(e)))) => panic!("el invitado falló: {e}"),
+                    Ok(Some(_)) => {}
+                    other => panic!("sin respuesta del invitado: {other:?}"),
+                }
+            };
+            println!("audio recibido en {:?}", t1.elapsed());
+            assert_eq!(&*got, &*audio);
+        });
+    }
+
+    #[test]
+    fn nombres() {
         assert_eq!(clean_name("  Ana\n ", "x"), "Ana");
         assert_eq!(clean_name("", "Invitado"), "Invitado");
         assert_eq!(clean_name(&"a".repeat(50), "x").len(), 32);

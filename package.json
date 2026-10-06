@@ -1,0 +1,27 @@
+{
+  "name": "youtubeinrustweb-herramientas",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Herramientas de desarrollo de YoutubeInRustWeb: grafo de código + vectores. No forma parte de la app.",
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "grafo": "node scripts/grafo/buscar.mjs",
+    "grafo:indexar": "node scripts/grafo/buscar.mjs --indexar"
+  },
+  "overrides": {
+    "@huggingface/transformers": {
+      "sharp": "0.35.4"
+    },
+    "onnxruntime-node": {
+      "adm-zip": "0.6.1"
+    }
+  },
+  "devDependencies": {
+    "@colbymchenry/codegraph": "1.6.0",
+    "@huggingface/transformers": "4.2.0"
+  }
+}

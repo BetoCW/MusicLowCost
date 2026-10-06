@@ -1,4 +1,4 @@
-YoutubeInRustWeb 0.4.0  (MusicLowCost)
+YoutubeInRustWeb 0.5.0  (MusicLowCost)
 ======================================
 
 Native YouTube Music player written in Rust.
@@ -13,6 +13,17 @@ FIRST RUN
 
 2. YOUTUBE MUSIC works without an account. To see your likes and playlists:
    Settings ("Ajustes") -> "Iniciar sesión con Google".
+
+UPDATES
+-------
+No need to download each version again: when the "UpDate" button (top right) turns
+red there is a new version. Click it once; the app updates itself and reopens.
+
+JAM (LISTEN TOGETHER)
+---------------------
+Works over the internet from different places. The host opens "Jam", picks a name and
+a password and clicks "Crear Jam"; the others type the same name and password and
+click "Unirme". No IP addresses or router settings.
 
 "WINDOWS PROTECTED YOUR PC"
 ---------------------------

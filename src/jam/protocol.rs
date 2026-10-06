@@ -1,4 +1,4 @@
-//! Tramas del Jam sobre TCP: `[u32 largo LE][u8 tipo][datos]`.
+//! Tramas del Jam (sobre un stream de QUIC): `[u32 largo LE][u8 tipo][datos]`.
 //! - tipo 0: mensaje de control en JSON (pequeno).
 //! - tipo 1: pedazo de audio `[u32 tag LE][bytes]`; se lee directo al buffer de la
 //!   cancion, sin copias intermedias.
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// Ninguna trama de control puede pasar de esto (protege la memoria ante datos basura).
 pub const MAX_FRAME: usize = 512 * 1024;
 /// Tamano de cada pedazo de audio que se manda.

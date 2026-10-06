@@ -7,6 +7,7 @@ use super::{Backend, Cmd, load_lyrics, spawn};
 use crate::desktop;
 use crate::jam::{self, Event, Guest, Host, PlayState, Request};
 use crate::model::Track;
+use crate::stream::Growing;
 use crate::ui::ListKind;
 use slint::{ModelRc, SharedString, VecModel};
 use std::rc::Rc;
@@ -78,12 +79,32 @@ impl Backend {
     }
 
     /// Nueva cancion en el anfitrion. `data` = None si no se puede repartir.
-    pub(super) fn jam_host_track(&self, track: &Track, data: Option<Arc<[u8]>>) {
+    fn jam_host_track(&self, track: &Track, data: Option<Arc<[u8]>>) {
+        self.state.borrow_mut().jam_ready = true;
         self.with_host(|h| h.set_track(track, data));
     }
 
-    pub(super) fn jam_host_state(&self) {
+    /// A los invitados se les manda la cancion completa: si todavia se esta bajando, en
+    /// cuanto termine (mientras tanto siguen en pausa, ver `jam_host_hold`).
+    pub(super) fn jam_share_when_ready(self: &Rc<Self>, track: &Track, data: &Arc<Growing>, seq: u64) {
         if !self.is_jam_host() {
+            return;
+        }
+        if let Some(full) = data.full() {
+            return self.jam_host_track(track, Some(full));
+        }
+        let (b, track, data) = (self.clone(), track.clone(), data.clone());
+        spawn(async move {
+            let ok = data.wait_done().await.is_ok();
+            if b.state.borrow().play_seq == seq {
+                b.jam_host_track(&track, if ok { data.full() } else { None });
+                b.jam_host_state();
+            }
+        });
+    }
+
+    pub(super) fn jam_host_state(&self) {
+        if !self.is_jam_host() || !self.state.borrow().jam_ready {
             return;
         }
         let playing = self.engine.has_track() && !self.engine.is_paused() && !self.state.borrow().buffering;
@@ -109,21 +130,11 @@ impl Backend {
         self.with_host(|h| h.set_queue(upcoming));
     }
 
-    pub(super) fn jam_start_host(self: &Rc<Self>, name: String, port: u16) {
+    pub(super) fn jam_start_host(self: &Rc<Self>, name: String, room: String, password: String) {
         self.jam_leave(None);
-        let name = jam::clean_name(&name, "Anfitrión");
-        {
-            let mut st = self.state.borrow_mut();
-            st.cfg.jam_name = name.clone();
-            st.cfg.jam_port = port;
-        }
-        crate::config::save(&self.dir, &self.cfg());
+        let Some((name, room)) = self.jam_check_fields(&name, "Anfitrión", &room, &password) else { return };
         let id = jam::next_id();
-        let host = match Host::start(port, &name, jam::new_code(), self.tx.clone(), id) {
-            Ok(h) => h,
-            Err(e) => return self.jam_status(e),
-        };
-        let (code, port) = (host.code().to_string(), host.port());
+        let host = Host::start(&room, &password, &name, self.tx.clone(), id);
         *self.jam.borrow_mut() = Jam::Host { id, host };
         self.sync_fx();
         // Lo que ya esta sonando se comparte de inmediato.
@@ -131,40 +142,42 @@ impl Backend {
             let st = self.state.borrow();
             (st.current.clone(), st.current_data.clone())
         };
-        if let Some(t) = cur.filter(|_| self.engine.has_track()) {
-            self.jam_host_track(&t, data);
+        if let (Some(t), Some(data)) = (cur.filter(|_| self.engine.has_track()), data) {
+            let seq = self.state.borrow().play_seq;
+            self.jam_share_when_ready(&t, &data, seq);
             self.jam_host_state();
         }
         self.jam_host_queue();
-        let address = match jam::local_ip() {
-            Some(ip) => format!("{ip}:{port}"),
-            None => format!("(tu IP):{port}"),
-        };
-        log::info!("jam: creado en {address}");
+        log::info!("jam: abriendo la sala «{room}»");
         self.ui.state(move |s| {
             s.set_jam_role("host".into());
-            s.set_jam_code(code.into());
-            s.set_jam_address(address.into());
             s.set_jam_peers(strings(vec![]));
             s.set_jam_queue(strings(vec![]));
-            s.set_jam_status("Jam creado. Comparte la dirección y el código con quien quieras invitar.".into());
+            s.set_jam_status("Abriendo el Jam en internet…".into());
         });
+    }
+
+    /// Valida nombre, sala y contraseña y los recuerda. Devuelve (nombre, sala) limpios.
+    fn jam_check_fields(&self, name: &str, fallback: &str, room: &str, password: &str) -> Option<(String, String)> {
+        let name = jam::clean_name(name, fallback);
+        let room = jam::clean_name(room, "");
+        if room.is_empty() || password.chars().count() < 4 {
+            self.jam_status("Escribe el nombre del Jam y una contraseña de al menos 4 caracteres.");
+            return None;
+        }
+        {
+            let mut st = self.state.borrow_mut();
+            st.cfg.jam_name = name.clone();
+            st.cfg.jam_room = room.clone();
+        }
+        crate::config::save(&self.dir, &self.cfg());
+        Some((name, room))
     }
 
     /// Lo que pide un invitado: en el orden de la cola, despues de lo que ya pidieron otros.
     fn jam_add(self: &Rc<Self>, who: &str, track: Track) {
         let title = track.title.clone();
-        let (at, play_now) = {
-            let mut st = self.state.borrow_mut();
-            let len = st.queue.len();
-            let mut at = st.index.map(|i| i + 1).unwrap_or(len).min(len);
-            while at < st.queue.len() && st.jam_added.contains(&st.queue[at].id) {
-                at += 1;
-            }
-            st.jam_added.insert(track.id.clone());
-            st.queue.insert(at, track);
-            (at, !self.engine.has_track() && !st.buffering)
-        };
+        let (at, play_now) = self.insert_next(track, true);
         self.push_queue();
         self.clear_prefetch();
         if play_now {
@@ -177,16 +190,11 @@ impl Backend {
 
     // ---------- invitado ----------
 
-    pub(super) fn jam_join(self: &Rc<Self>, name: String, addr: String, code: String) {
+    pub(super) fn jam_join(self: &Rc<Self>, name: String, room: String, password: String) {
         self.jam_leave(None);
-        let name = jam::clean_name(&name, "Invitado");
-        if addr.trim().is_empty() || code.trim().is_empty() {
-            return self.jam_status("Escribe la dirección y el código que te pasó el anfitrión.");
-        }
+        let Some((name, room)) = self.jam_check_fields(&name, "Invitado", &room, &password) else { return };
         {
             let mut st = self.state.borrow_mut();
-            st.cfg.jam_name = name.clone();
-            st.cfg.jam_last_address = addr.trim().to_string();
             // Se cancela lo que se estuviera cargando y se guarda donde ibas.
             st.play_seq += 1;
             st.buffering = false;
@@ -195,11 +203,10 @@ impl Backend {
                 st.resuming = true;
             }
         }
-        crate::config::save(&self.dir, &self.cfg());
         self.engine.stop();
         self.on_play_state();
         let id = jam::next_id();
-        let guest = Guest::start(addr, code, name, self.tx.clone(), id);
+        let guest = Guest::start(room, password, name, self.tx.clone(), id);
         *self.jam.borrow_mut() = Jam::Guest(Box::new(GuestJam {
             id,
             guest,
@@ -221,9 +228,7 @@ impl Backend {
         let old = std::mem::replace(&mut *self.jam.borrow_mut(), Jam::Off);
         match old {
             Jam::Off => {}
-            Jam::Host { .. } => {
-                self.state.borrow_mut().jam_added.clear();
-            }
+            Jam::Host { .. } => {}
             Jam::Guest(_) => {
                 // Se suelta lo del anfitrion; tu cola queda como estaba.
                 self.engine.stop();
@@ -373,7 +378,7 @@ impl Backend {
             }
             _ => return,
         };
-        if let Err(e) = self.engine.load(data, true) {
+        if let Err(e) = self.engine.load(&Growing::complete(data), true) {
             return self.ui.status(e);
         }
         {
@@ -402,7 +407,7 @@ impl Backend {
         if !self.engine.has_track() || self.engine.finished() {
             // Termino aqui pero el anfitrion la sigue (repetir una, o volvio atras).
             let restart = state.playing && if duration > 0.0 { expected + 1.0 < duration } else { expected < 2.0 };
-            if !restart || self.engine.load(data, true).is_err() {
+            if !restart || self.engine.load(&Growing::complete(data), true).is_err() {
                 return;
             }
         }

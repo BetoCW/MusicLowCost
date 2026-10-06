@@ -3,13 +3,21 @@
 //! equalizer y skip-silences de Pear pero en Rust puro.
 
 use rodio::{ChannelCount, Decoder, Player, SampleRate, Source};
-use std::io::Cursor;
+use crate::stream::Growing;
 use std::num::NonZero;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 pub const EQ_FREQS: [f32; 10] = [60.0, 170.0, 310.0, 600.0, 1000.0, 3000.0, 6000.0, 12000.0, 14000.0, 16000.0];
+
+/// Preajustes del ecualizador (dB por banda): plano, mas graves, voces, mas agudos.
+pub const EQ_PRESETS: [[f32; 10]; 4] = [
+    [0.0; 10],
+    [6.0, 5.0, 4.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    [-2.0, -1.0, 0.0, 2.0, 4.0, 4.0, 3.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 4.0, 5.0, 6.0, 6.0],
+];
 
 /// Parametros compartidos entre la interfaz y el hilo de audio.
 pub struct Effects {
@@ -40,6 +48,8 @@ impl Effects {
 pub struct Engine {
     mixer: rodio::mixer::Mixer,
     player: Mutex<Option<Player>>,
+    /// Audio cargado y si se abrio con seek (solo cuando ya estaba completo).
+    source: Mutex<Option<(Arc<Growing>, bool)>>,
     pub fx: Arc<Effects>,
     volume: Mutex<f32>,
 }
@@ -66,17 +76,21 @@ impl Engine {
             })
             .map_err(|e| e.to_string())?;
         let mixer = rx.recv().map_err(|e| e.to_string())??;
-        Ok(Arc::new(Self { mixer, player: Mutex::new(None), fx, volume: Mutex::new(0.8) }))
+        Ok(Arc::new(Self { mixer, player: Mutex::new(None), source: Mutex::new(None), fx, volume: Mutex::new(0.8) }))
     }
 
-    /// Reemplaza lo que suena por `data` (archivo M4A completo en memoria).
-    pub fn load(&self, data: Arc<[u8]>, start_paused: bool) -> Result<(), String> {
-        let len = data.len() as u64;
+    /// Reemplaza lo que suena por `src` (M4A en memoria, completo o todavia bajando).
+    ///
+    /// Si todavia se esta descargando se abre sin seek: con seek, symphonia recorre todos
+    /// los fragmentos del archivo al abrirlo y habria que esperar la descarga entera. El
+    /// primer seek reabre el audio (ya completo) con seek; ver `seek`.
+    pub fn load(&self, src: &Arc<Growing>, start_paused: bool) -> Result<(), String> {
+        let seekable = src.is_done();
         let decoder = Decoder::builder()
-            .with_data(Cursor::new(data))
-            .with_byte_len(len)
+            .with_data(src.reader())
+            .with_byte_len(src.total)
             .with_hint("m4a")
-            .with_seekable(true)
+            .with_seekable(seekable)
             .build()
             .map_err(|e| format!("no se pudo decodificar el audio: {e}"))?;
         let player = Player::connect_new(&self.mixer);
@@ -87,11 +101,18 @@ impl Engine {
         player.append(Fx::new(decoder, self.fx.clone()));
         // Al soltar el Player anterior deja de sonar.
         *self.player.lock().unwrap() = Some(player);
+        *self.source.lock().unwrap() = Some((src.clone(), seekable));
         Ok(())
     }
 
     pub fn stop(&self) {
         *self.player.lock().unwrap() = None;
+        *self.source.lock().unwrap() = None;
+    }
+
+    /// true si un seek se puede hacer ya (el audio se abrio con seek o ya termino de bajar).
+    pub fn can_seek(&self) -> bool {
+        self.source.lock().unwrap().as_ref().is_some_and(|(s, seekable)| *seekable || s.is_done())
     }
 
     fn with<T>(&self, f: impl FnOnce(&Player) -> T) -> Option<T> {
@@ -117,12 +138,32 @@ impl Engine {
     pub fn position(&self) -> f64 {
         self.with(|p| p.get_pos().as_secs_f64()).unwrap_or(0.0)
     }
-    pub fn seek(&self, secs: f64) {
+    /// Devuelve false si todavia no se puede (el audio sigue bajando): ver `can_seek`.
+    pub fn seek(&self, secs: f64) -> bool {
+        let src = self.source.lock().unwrap().clone();
+        let Some((src, seekable)) = src else { return false };
+        if !seekable && !src.is_done() {
+            // Volver al principio no necesita seek: se reabre desde el inicio.
+            if secs < 0.5 {
+                let paused = self.is_paused();
+                return self.load(&src, paused).is_ok();
+            }
+            return false;
+        }
+        if !seekable {
+            // Ya bajo completo: se reabre con seek, conservando la pausa.
+            let paused = self.is_paused();
+            if let Err(e) = self.load(&src, paused) {
+                log::warn!("seek: {e}");
+                return false;
+            }
+        }
         self.with(|p| {
             if let Err(e) = p.try_seek(Duration::from_secs_f64(secs.max(0.0))) {
                 log::warn!("seek: {e}");
             }
         });
+        true
     }
     /// `v` en 0..=1 ya con la curva aplicada.
     pub fn set_volume(&self, v: f32) {

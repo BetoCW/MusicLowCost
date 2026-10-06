@@ -19,6 +19,9 @@ use wry::{Rect, WebContext, WebView, WebViewBuilder};
 const START_URL: &str =
     "https://accounts.google.com/ServiceLogin?service=youtube&passive=true&continue=https%3A%2F%2Fmusic.youtube.com%2F";
 
+/// Pagina sin JavaScript a la que se va antes de copiar las cookies (ver abajo).
+const PARK_URL: &str = "https://www.youtube.com/robots.txt";
+
 /// Cookies que indican que la sesion ya esta iniciada.
 const SESSION_COOKIES: &[&str] = &["SAPISID", "__Secure-3PAPISID"];
 
@@ -86,6 +89,8 @@ pub fn run(out: PathBuf, center: Option<(i32, i32)>) {
     let weak = window.as_weak();
     let wv = webview.clone();
     let last = last_url.clone();
+    // Ticks desde que se mando la ventana a PARK_URL (0 = todavia no).
+    let parked = Rc::new(RefCell::new(0u32));
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(700), move || {
         let Some(w) = weak.upgrade() else { return };
@@ -102,6 +107,18 @@ pub fn run(out: PathBuf, center: Option<(i32, i32)>) {
         if !cookies.iter().any(|c| SESSION_COOKIES.contains(&c.name())) {
             return;
         }
+        // YouTube rota las cookies cada pocos minutos mientras su pagina esta abierta, y las
+        // copiadas dejarian de servir. Antes de copiarlas se pasa a una pagina sin JavaScript
+        // (lo que recomienda yt-dlp) y se espera un momento a que cargue.
+        // Si esa pagina no carga en ~5 s se copian igual (mejor que dejar el login colgado).
+        if !last.borrow().ends_with("/robots.txt") && *parked.borrow() < 8 {
+            if *parked.borrow() == 0 {
+                let _ = webview.load_url(PARK_URL);
+            }
+            *parked.borrow_mut() += 1;
+            return;
+        }
+        let Ok(cookies) = webview.cookies_for_url("https://music.youtube.com/") else { return };
         let header = cookies.iter().map(|c| format!("{}={}", c.name(), c.value())).collect::<Vec<_>>().join("; ");
         match std::fs::write(&out, header) {
             Ok(()) => trace(&format!("sesión obtenida ({} cookies)", cookies.len())),

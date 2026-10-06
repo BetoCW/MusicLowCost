@@ -1,6 +1,7 @@
 //! Invitado: se conecta al anfitrion, sincroniza el reloj, recibe el audio de cada
 //! cancion y le pasa al backend que tocar. Lo que el usuario pida se manda al anfitrion.
 
+use super::net::{self, Keep, Rd, Wr};
 use super::protocol::{self, Frame, MAX_AUDIO, Msg, Request, VERSION};
 use super::{Clock, Event};
 use crate::backend::Cmd;
@@ -8,8 +9,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::AbortHandle;
 
@@ -26,13 +25,23 @@ enum Out {
 }
 
 impl Guest {
-    /// Empieza a conectarse en segundo plano; el resultado llega como `Event`.
-    pub fn start(addr: String, code: String, name: String, tx: UnboundedSender<Cmd>, id: u32) -> Guest {
+    /// Empieza a conectarse a la sala en segundo plano; el resultado llega como `Event`.
+    pub fn start(room: String, password: String, name: String, tx: UnboundedSender<Cmd>, id: u32) -> Guest {
+        Self::start_with(Dial::Room(room), password, name, tx, id)
+    }
+
+    /// Para las pruebas: se conecta por TCP local (sin internet).
+    #[cfg(test)]
+    pub fn start_tcp(addr: String, password: String, name: String, tx: UnboundedSender<Cmd>, id: u32) -> Guest {
+        Self::start_with(Dial::Tcp(addr), password, name, tx, id)
+    }
+
+    fn start_with(dial: Dial, code: String, name: String, tx: UnboundedSender<Cmd>, id: u32) -> Guest {
         let (ctrl, rx) = unbounded_channel();
         let clock = Rc::new(RefCell::new(Clock::new()));
         let (clock2, ctrl2) = (clock.clone(), ctrl.clone());
         let task = tokio::task::spawn_local(async move {
-            let reason = match session(&addr, &code, &name, &tx, id, rx, ctrl2, clock2).await {
+            let reason = match session(dial, &code, &name, &tx, id, rx, ctrl2, clock2).await {
                 Ok(()) => "El anfitrión terminó el Jam.".to_string(),
                 Err(e) => e,
             };
@@ -54,19 +63,27 @@ impl Drop for Guest {
     }
 }
 
-/// Acepta "ip:puerto", "ip" (puerto por defecto) o "[ipv6]:puerto".
-fn with_port(addr: &str) -> String {
-    let a = addr.trim();
-    let has_port = match a.rsplit_once(':') {
-        Some((h, p)) => p.parse::<u16>().is_ok() && (!h.contains(':') || h.ends_with(']')),
-        None => false,
-    };
-    if has_port { a.to_string() } else { format!("{a}:{}", super::DEFAULT_PORT) }
+enum Dial {
+    Room(String),
+    #[cfg(test)]
+    Tcp(String),
+}
+
+async fn dial(d: &Dial, code: &str) -> Result<(Rd, Wr, Keep), String> {
+    match d {
+        Dial::Room(room) => net::connect(room, code).await,
+        #[cfg(test)]
+        Dial::Tcp(addr) => {
+            let s = tokio::net::TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
+            let (rd, wr) = s.into_split();
+            Ok((Box::new(rd), Box::new(wr), Box::new(())))
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn session(
-    addr: &str,
+    d: Dial,
     code: &str,
     name: &str,
     tx: &UnboundedSender<Cmd>,
@@ -78,21 +95,16 @@ async fn session(
     let event = |e: Event| {
         let _ = tx.send(Cmd::Jam(id, e));
     };
-    let addr = with_port(addr);
-    event(Event::Status(format!("Conectando a {addr}…")));
-    let stream = tokio::time::timeout(Duration::from_secs(8), TcpStream::connect(&addr))
-        .await
-        .map_err(|_| format!("{addr} no responde (¿misma red?, ¿firewall?)."))?
-        .map_err(|e| format!("No se pudo conectar a {addr}: {e}"))?;
-    let _ = stream.set_nodelay(true);
-    let (mut rd, mut wr) = stream.into_split();
-    protocol::write_msg(&mut wr, &Msg::Hello { v: VERSION, code: code.trim().to_uppercase(), name: name.to_string() })
+    event(Event::Status("Buscando el Jam…".into()));
+    let (mut rd, mut wr, _keep) = dial(&d, code).await?;
+    protocol::write_msg(&mut wr, &Msg::Hello { v: VERSION, code: code.to_string(), name: name.to_string() })
         .await
         .map_err(|e| e.to_string())?;
-    match tokio::time::timeout(Duration::from_secs(8), protocol::read_frame(&mut rd)).await {
+    match tokio::time::timeout(Duration::from_secs(15), protocol::read_frame(&mut rd)).await {
         Ok(Ok(Frame::Msg(Msg::Welcome { host }))) => event(Event::Joined(host)),
         Ok(Ok(Frame::Msg(Msg::Reject { reason }))) => return Err(reason),
         Ok(Err(e)) => return Err(format!("El anfitrión cerró la conexión: {e}")),
+        // Por internet el primer mensaje puede tardar mas (relay).
         _ => return Err("El anfitrión no respondió.".into()),
     }
 
@@ -114,7 +126,7 @@ async fn session(
     r
 }
 
-async fn read_loop(rd: &mut OwnedReadHalf, event: &impl Fn(Event), clock: &RefCell<Clock>) -> Result<(), String> {
+async fn read_loop(rd: &mut Rd, event: &impl Fn(Event), clock: &RefCell<Clock>) -> Result<(), String> {
     // Audio de la cancion actual mientras llega: (tag, bytes, tamano total).
     let mut incoming: Option<(u32, Vec<u8>, usize)> = None;
     loop {
@@ -155,7 +167,7 @@ async fn read_loop(rd: &mut OwnedReadHalf, event: &impl Fn(Event), clock: &RefCe
     }
 }
 
-async fn writer(mut wr: OwnedWriteHalf, mut rx: UnboundedReceiver<Out>, clock: Rc<RefCell<Clock>>) {
+async fn writer(mut wr: Wr, mut rx: UnboundedReceiver<Out>, clock: Rc<RefCell<Clock>>) {
     use tokio::io::AsyncWriteExt;
     while let Some(o) = rx.recv().await {
         let r = match o {
@@ -168,18 +180,5 @@ async fn writer(mut wr: OwnedWriteHalf, mut rx: UnboundedReceiver<Out>, clock: R
         if r.is_err() {
             return;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn agrega_el_puerto_por_defecto() {
-        assert_eq!(with_port("192.168.1.20"), "192.168.1.20:26541");
-        assert_eq!(with_port(" 192.168.1.20:4000 "), "192.168.1.20:4000");
-        assert_eq!(with_port("mi-pc.local"), "mi-pc.local:26541");
-        assert_eq!(with_port("[fe80::1]:4000"), "[fe80::1]:4000");
     }
 }
