@@ -270,6 +270,8 @@ struct Fx<S: Source> {
     frame: [f32; MAX_CH],
     pending: usize,
     pending_len: usize,
+    // Ya salio la primera muestra con sonido (solo para las mediciones de bench).
+    heard: bool,
 }
 
 impl<S: Source> Fx<S> {
@@ -293,6 +295,7 @@ impl<S: Source> Fx<S> {
             frame: [0.0; MAX_CH],
             pending: 0,
             pending_len: 0,
+            heard: false,
         };
         me.refresh();
         me
@@ -308,6 +311,13 @@ impl<S: Source> Fx<S> {
                 let kind = if i == 0 { 0 } else if i == 9 { 2 } else { 1 };
                 self.filters[i] = Biquad::new(kind, *f, gains[i], self.sample_rate);
             }
+        }
+    }
+
+    fn mark_heard(&mut self) {
+        if !self.heard {
+            self.heard = true;
+            crate::bench::event("lat_first_loud_sample", 0);
         }
     }
 
@@ -332,6 +342,9 @@ impl<S: Source> Iterator for Fx<S> {
 
     fn next(&mut self) -> Option<f32> {
         self.counter = self.counter.wrapping_add(1);
+        if self.counter == 1 {
+            crate::bench::event("lat_first_sample", 0);
+        }
         if self.counter % 4096 == 0 {
             self.refresh();
         }
@@ -356,12 +369,16 @@ impl<S: Source> Iterator for Fx<S> {
                     self.skipping = false;
                     self.pending = 1;
                     self.pending_len = self.channels;
+                    self.mark_heard();
                     let s = self.frame[0];
                     return Some(self.eq(s));
                 }
             }
         }
         let s = self.inner.next()?;
+        if !self.heard && s.abs() > SILENCE {
+            self.mark_heard();
+        }
         Some(self.eq(s))
     }
 }

@@ -5,6 +5,7 @@ slint::include_modules!();
 
 mod audio;
 mod backend;
+mod bench;
 mod config;
 mod desktop;
 mod images;
@@ -27,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const SINGLE_INSTANCE_PORT: u16 = 26540;
 
 fn main() {
+    bench::event("main", 0);
     // Software renderer: sin OpenGL/DirectX, la ventana entera gasta ~6 MB.
     // SAFETY: todavia no hay otros hilos.
     unsafe { std::env::set_var("SLINT_BACKEND", "winit-software") };
@@ -97,6 +99,8 @@ fn main() {
     }
 
     ui.show().expect("no se pudo mostrar la ventana");
+    bench::event("shown", 0);
+    bench::start(&ui);
 
     let hwnd = window_hwnd(&ui);
     let toggle = {
@@ -197,6 +201,8 @@ fn wire_callbacks(ui: &AppWindow, tx: &tokio::sync::mpsc::UnboundedSender<Cmd>) 
     s.on_previous(move || send!(t, Cmd::Previous));
     let t = tx.clone();
     s.on_seek(move |p| send!(t, Cmd::Seek(p as f64)));
+    let t = tx.clone();
+    s.on_seek_by(move |d| send!(t, Cmd::SeekBy(d as f64)));
     let t = tx.clone();
     s.on_set_volume(move |v| send!(t, Cmd::SetVolume(v)));
     let t = tx.clone();

@@ -46,6 +46,8 @@ pub enum Cmd {
     Next,
     Previous,
     Seek(f64),
+    /// Adelantar o atrasar desde donde va (segundos, negativo = atras).
+    SeekBy(f64),
     SetVolume(f32),
     VolumeWheel(f32),
     ToggleShuffle,
@@ -385,6 +387,16 @@ impl Backend {
                     self.on_play_state();
                 } else {
                     self.state.borrow_mut().restore_position = Some(secs);
+                }
+            }
+            Cmd::SeekBy(delta) => {
+                if self.engine.has_track() {
+                    // Si hay un seek esperando a que baje el audio, se cuenta desde ahi.
+                    let from = self.state.borrow().pending_seek.unwrap_or_else(|| self.engine.position());
+                    let dur = self.state.borrow().current.as_ref().map_or(0.0, |t| t.duration as f64);
+                    let max = if dur > 1.0 { dur - 1.0 } else { f64::MAX };
+                    self.seek_to((from + delta).clamp(0.0, max));
+                    self.on_play_state();
                 }
             }
             Cmd::SetVolume(v) => self.set_volume(v),
@@ -1075,6 +1087,7 @@ async fn play_failed(b: &B, track: &Track, seq: u64, e: String) {
 }
 
 async fn load_and_play(b: B, track: Track, seq: u64, autoplay: bool) {
+    crate::bench::event("lat_load_start", 0);
     let restore = b.state.borrow_mut().restore_position.take().filter(|p| *p > 1.0);
     // Saltando canciones muy rapido: se espera un instante antes de correr yt-dlp, para
     // no resolver cada cancion por la que se pasa (YouTube lo toma como un robot).
@@ -1127,6 +1140,7 @@ async fn load_and_play(b: B, track: Track, seq: u64, autoplay: bool) {
         b.ui.status(e);
         return;
     }
+    crate::bench::event("lat_engine_loaded", 0);
     if let Some(pos) = restore {
         b.engine.seek(pos);
     }

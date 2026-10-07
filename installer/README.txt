@@ -1,4 +1,4 @@
-YoutubeInRustWeb 0.5.0  (MusicLowCost)
+YoutubeInRustWeb 0.5.1  (MusicLowCost)
 ======================================
 
 Native YouTube Music player written in Rust.

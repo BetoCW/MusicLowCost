@@ -50,6 +50,7 @@ Grab `YoutubeInRustWeb-Setup.exe` from the [latest release](https://github.com/B
 - Queue: *+* adds a song right after the current one (after any songs you added before it);
   press and drag a song to reorder it; automatic radio ("similar songs", can be turned off),
   shuffle and repeat.
+- Player bar buttons to jump **10 s back / forward** in the current song.
 - Synced lyrics (LRCLIB) or YouTube Music's official lyrics.
 - Windows media overlay and hardware media keys, tray icon, global hotkeys
   (`Ctrl+Shift+Space`, `Ctrl+Shift+←/→`, `Ctrl+Shift+Y`).
@@ -122,10 +123,13 @@ src/images.rs             small cover art with a bounded cache
 src/desktop.rs            tray, global hotkeys, media overlay (SMTC)
 src/login.rs              Google sign-in window (`--login` process)
 src/integrations/         discord, scrobbler, lyrics (LRCLIB), sponsorblock, local API
+src/bench.rs              dev only: performance measurements (does nothing unless YIR_BENCH_FILE is set)
 installer/                Inno Setup script
 vendor/                   two crates with a small patch each (search "YoutubeInRustWeb" in them):
                             rustypipe: user playlists without header (YouTube 2026-10), no panic
                             i-slint-backend-winit: always repaint/present the whole window
+                              (and, with YIR_BENCH_FILE, log the time of each frame)
+scripts/bench.ps1         dev only: runs the benchmark scenarios (see "Benchmarks")
 scripts/grafo/            dev only: code graph + semantic search (see CLAUDE.md)
 version-webview/          previous version (Tauri + WebView2, ~290 MB)
 ```
@@ -163,6 +167,20 @@ $env:YIR_DATA_DIR = "C:\some\temp\folder"   # separate data folder, no single-in
 ```
 
 Data and log: `%APPDATA%\YoutubeInRustWeb\` (`config.json`, `session.json`, `app.log`).
+
+## Benchmarks
+
+`scriptsench.ps1` launches the release build with a separate data folder, drives it by itself
+(`start`, `scroll`, `play`, `latency`, `seek` scenarios; see `src/bench.rs`) and reports frame times,
+memory and click-to-sound latency:
+
+```powershell
+powershell -Command "& .scriptsench.ps1 -Runs 5 -Scenarios start,scroll,play"
+powershell -Command "& .scriptsench.ps1 -Runs 10 -Scenarios latency"
+```
+
+Results so far: [`BENCHMARK_BASELINE.md`](BENCHMARK_BASELINE.md) (rendering, memory, startup, binary size)
+and [`BENCHMARK_LATENCY.md`](BENCHMARK_LATENCY.md) (click to sound: ~2.2 s, ~89 % of it is yt-dlp).
 
 ## Icon
 

@@ -44,6 +44,7 @@ impl Images {
         let bytes = self.http.get(url).send().await.ok()?.bytes().await.ok()?;
         // Decodificar fuera del hilo de trabajo para no retrasar los comandos (play, siguiente…).
         let pixels = tokio::task::spawn_blocking(move || {
+            let _t = crate::bench::Timed("cover_decode_us", std::time::Instant::now());
             let img = image::load_from_memory(&bytes).ok()?;
             let img = if img.width() > size || img.height() > size {
                 img.thumbnail(size, size)

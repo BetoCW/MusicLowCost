@@ -329,7 +329,9 @@ pub fn write_cookie_file(header: &str, path: &Path) -> Result<(), String> {
 /// Bloqueante: llamar desde spawn_blocking. `cookies`: archivo de cookies para yt-dlp
 /// (solo cuando YouTube pide confirmar que no eres un robot).
 pub fn resolve(video_id: &str, low_quality: bool, cookies: Option<&Path>) -> Result<Resolved, String> {
+    crate::bench::event("lat_t1_resolve_start", 0);
     if let Some(r) = cached_resolve(video_id, low_quality) {
+        crate::bench::event("lat_t2_resolved", 1);
         return Ok(r);
     }
     // Solo AAC/M4A: es lo que decodifica symphonia sin librerias extra.
@@ -376,6 +378,7 @@ pub fn resolve(video_id: &str, low_quality: bool, cookies: Option<&Path>) -> Res
         _ => BROWSER_UA.to_string(),
     };
     let r = Resolved { url, user_agent };
+    crate::bench::event("lat_t2_resolved", 0);
     RESOLVED.lock().unwrap().push((video_id.to_string(), low_quality, r.clone(), valid_until(&r.url)));
     Ok(r)
 }
@@ -578,6 +581,7 @@ pub async fn start_download(http: &reqwest::Client, r: &Resolved) -> Result<Arc<
     };
     let g = Growing::new(total);
     let mut resp = open_range(http, r, 0, RANGE.min(total) - 1).await?;
+    crate::bench::event("lat_t3_http_headers", 0);
     while g.len() < FIRST_CHUNK.min(total as usize) {
         match resp.chunk().await.map_err(|e| format!("descarga: {}", error_chain(&e)))? {
             Some(c) => g.push(&c),
@@ -587,6 +591,7 @@ pub async fn start_download(http: &reqwest::Client, r: &Resolved) -> Result<Arc<
     if g.len() == 0 {
         return Err("descarga vacía".into());
     }
+    crate::bench::event("lat_t4_first_chunk", g.len() as u64);
     let (g2, http, r) = (g.clone(), http.clone(), r.clone());
     tokio::task::spawn_local(async move {
         let mut resp = Some(resp);

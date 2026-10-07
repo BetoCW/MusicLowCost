@@ -16,6 +16,28 @@ use winit::event_loop::ActiveEventLoop;
 
 use super::WinitCompatibleRenderer;
 
+/// YoutubeInRustWeb: with `YIR_BENCH_FILE` set, append one line per frame
+/// (`f <unix us at end> <render+present us> <w> <h>`) for the benchmarks.
+fn bench_frame(t0: std::time::Instant, w: u32, h: u32) {
+    use std::io::Write;
+    static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        let path = std::env::var_os("YIR_BENCH_FILE")?;
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some(std::sync::Mutex::new(f))
+    });
+    let Some(file) = file else { return };
+    let us = t0.elapsed().as_micros();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    if let Ok(mut f) = file.lock() {
+        let _ = f.write_all(format!("f {now} {us} {w} {h}\n").as_bytes());
+    }
+}
+
 pub struct WinitSoftwareRenderer {
     renderer: SoftwareRenderer,
     _context: RefCell<Option<softbuffer::Context<Arc<winit::window::Window>>>>,
@@ -98,6 +120,7 @@ impl super::WinitCompatibleRenderer for WinitSoftwareRenderer {
         };
 
         let winit_window = surface.window().clone();
+        let bench_t0 = std::time::Instant::now();
 
         surface
             .resize(width, height)
@@ -151,6 +174,7 @@ impl super::WinitCompatibleRenderer for WinitSoftwareRenderer {
         let _ = region;
         winit_window.pre_present_notify();
         target_buffer.present().map_err(|e| format!("Error presenting softbuffer buffer: {e}"))?;
+        bench_frame(bench_t0, width.get(), height.get());
         Ok(DrawOutcome::Success)
     }
 

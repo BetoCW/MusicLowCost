@@ -92,6 +92,8 @@ export global AppState {
     callback next();
     callback previous();
     callback seek(float);
+    // Adelantar o atrasar (segundos, negativo = atras).
+    callback seek-by(float);
     callback set-volume(float);
     callback volume-wheel(float);
     callback toggle-shuffle();
@@ -924,6 +926,7 @@ component PlayerBar inherits Rectangle {
                 spacing: 6px;
                 IconButton { glyph: "⇄"; active: AppState.shuffle; clicked => { AppState.toggle-shuffle(); } }
                 IconButton { glyph: "⏮"; clicked => { AppState.previous(); } }
+                IconButton { glyph: "-10"; glyph-size: 12px; clicked => { AppState.seek-by(-10); } }
                 IconButton {
                     glyph: AppState.playing ? "⏸" : "▶";
                     size: 44px;
@@ -931,6 +934,7 @@ component PlayerBar inherits Rectangle {
                     Text { text: parent.glyph; color: #000; font-size: 20px; }
                     clicked => { AppState.toggle-play(); }
                 }
+                IconButton { glyph: "+10"; glyph-size: 12px; clicked => { AppState.seek-by(10); } }
                 IconButton { glyph: "⏭"; clicked => { AppState.next(); } }
                 IconButton {
                     glyph: AppState.repeat == 2 ? "🔂" : "🔁";

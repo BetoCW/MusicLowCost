@@ -72,6 +72,7 @@ impl Ui {
     }
 
     pub fn run(&self, f: impl FnOnce(&AppWindow) + Send + 'static) {
+        crate::bench::count_invoke();
         let weak = self.weak.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = weak.upgrade() {
@@ -142,6 +143,7 @@ impl Ui {
             if let Some(mut row) = m.row_data(index) {
                 if row.id == id.as_str() {
                     row.cover = Image::from_rgba8(p);
+                    crate::bench::count_row_set();
                     m.set_row_data(index, row);
                 }
             }
@@ -154,6 +156,7 @@ impl Ui {
             if let Some(mut row) = m.row_data(index) {
                 if row.id == id.as_str() {
                     row.cover = Image::from_rgba8(p);
+                    crate::bench::count_row_set();
                     m.set_row_data(index, row);
                 }
             }
@@ -170,6 +173,7 @@ impl Ui {
                         let cur = id.as_deref() == Some(row.id.as_str());
                         if row.current != cur {
                             row.current = cur;
+                            crate::bench::count_row_set();
                             m.set_row_data(i, row);
                         }
                     }
